@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+
+# Node
+node_modules/
+.next/
+
+# Chrome profiles (large binary data)
+fb_chrome_real_profile/
+backend/fb_chrome_real_profile/
+backend/fb_chrome_profile/
+backend/fb_profile/
+
+# Output / debug files
+output_facebook/
+fb_keyword_debug/
+backend/fb_keyword_debug/
+backend/debug_output/
+backend/fb_debug_output/
+backend/fb_dom_debug_output/
+backend/fb_deep_jobs/
+backend/data_fb_profiles/
+backend/output_fb_profiles/
+backend/output_facebook/
+backend/session/
+backend/fb_output/
+
+# Debug images & logs
+*.png
+debug_*.json
+debug_*.txt
+fb_dom_debug_dump.json
+route_test.txt
+
+# IDE
+.vscode/
+.qwen/
+
+# OS
+.DS_Store
+Thumbs.db

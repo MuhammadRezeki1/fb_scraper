@@ -1,0 +1,798 @@
+"use client";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { api, DeepJobState, DeepPost } from "@/lib/api";
+import {
+  Search, Loader2, ExternalLink, FileText, Users, Video,
+  Grid3x3, Hash, TrendingUp, Play, Square, RefreshCw,
+  CheckCircle, XCircle, Clock, AlertCircle, ChevronDown, ChevronUp,
+  Heart, MessageCircle, Eye, Share2, Newspaper, AlertTriangle,
+} from "lucide-react";
+import GlassCard from "@/components/ui/GlassCard";
+import DownloadButton from "@/components/ui/DownloadButton";
+import { useScrape } from "@/contexts/ScrapeContext";
+import { usePersistState } from "@/hooks/usePersistState";
+
+type DeepMode = "keyword" | "hashtag" | "trending";
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+function groupByType(items: DeepPost[]) {
+  const groups = {
+    posts:  [] as DeepPost[],
+    videos: [] as DeepPost[],
+    pages:  [] as DeepPost[],
+    groups: [] as DeepPost[],
+    other:  [] as DeepPost[],
+  };
+  for (const item of items) {
+    const t = item.type?.toLowerCase() || "";
+    if (t === "posts" || t === "post")                               groups.posts.push(item);
+    else if (t === "videos" || t === "video" || t === "reel" || t === "reels") groups.videos.push(item);
+    else if (t === "pages" || t === "page")                          groups.pages.push(item);
+    else if (t === "groups" || t === "group")                        groups.groups.push(item);
+    else                                                             groups.other.push(item);
+  }
+  return groups;
+}
+
+const GROUP_META: Record<string, { label: string; color: string; icon: React.ReactNode }> = {
+  posts:  { label: "Postingan",   color: "#3b6dce", icon: <FileText  size={14} /> },
+  videos: { label: "Video/Reels", color: "#c0394f", icon: <Video     size={14} /> },
+  pages:  { label: "Halaman",     color: "#1d7a47", icon: <Users     size={14} /> },
+  groups: { label: "Grup",        color: "#9e6c0a", icon: <Grid3x3   size={14} /> },
+  other:  { label: "Lainnya",     color: "#8890aa", icon: <Search    size={14} /> },
+};
+
+/** Ambil domain dari URL untuk dijadikan nama media */
+function mediaDomain(url?: string): string {
+  if (!url) return "";
+  try {
+    const { hostname, pathname } = new URL(url);
+    // Cek apakah ini halaman profile/page FB tertentu
+    const pathClean = pathname.replace(/\/$/, "");
+    const slug = pathClean.split("/").find(s => s && !["www", "facebook", "watch", "groups", "pages", "photo", "photos", "videos", "reel", "reels", "posts", "permalink"].includes(s.toLowerCase()));
+    if (slug && slug.length > 2 && !slug.startsWith("?") && !/^\d{10,}$/.test(slug)) return slug.replace(/[._-]/g, " ");
+    return hostname.replace("www.", "");
+  } catch {
+    return "";
+  }
+}
+
+/** Apakah post ini benar-benar post (bukan sekadar URL halaman/hashtag)? */
+function isRealPost(post: DeepPost): boolean {
+  if (post.type === "groups" && post.group_name) return true;
+  const u = post.url?.toLowerCase() || "";
+  // Exclude: hashtag pages, pure profile pages, pure group homepages
+  if (u.includes("/hashtag/")) return false;
+  if (/facebook\.com\/[a-z0-9._-]+\/?$/.test(u) && !/\/(posts|permalink|photo|video|reel)/.test(u)) {
+    // Profile/page homepage — masih boleh tampil tapi tandai "terbatas"
+    return false;
+  }
+  return true;
+}
+
+function hasEngagement(post: DeepPost): boolean {
+  return (post.likes_count || 0) > 0 || (post.comments_count || 0) > 0 || (post.views_count || 0) > 0 || (post.shares_count || 0) > 0;
+}
+
+function hasContent(post: DeepPost): boolean {
+  return !!((post.group_about || post.caption || post.text || "").trim());
+}
+
+function compactUrl(url?: string) {
+  if (!url) return "URL tidak tersedia";
+  try {
+    const u = new URL(url);
+    return `${u.hostname}${u.pathname}${u.search}`.replace(/\/$/, "").slice(0, 80);
+  } catch {
+    return url.slice(0, 80);
+  }
+}
+
+function primaryText(post: DeepPost) {
+  return (post.group_about || post.caption || post.text || "").trim();
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
+}
+
+function fmtNum(n?: number): string {
+  if (!n || n === 0) return "0";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}jt`;
+  if (n >= 1_000)     return `${(n / 1_000).toFixed(1)}rb`;
+  return n.toLocaleString("id-ID");
+}
+
+// ─── CommentSection ──────────────────────────────────────────────────────────
+
+function CommentSection({ post }: { post: DeepPost }) {
+  const [expanded, setExpanded] = useState(false);
+
+  if (post.comments_scrape_failed) {
+    return (
+      <div className="mt-3 flex items-center gap-2 px-3 py-2 rounded-xl text-xs" style={{ background: "rgba(192,57,79,0.06)", border: "1px solid rgba(192,57,79,0.15)", color: "#c0394f" }}>
+        <AlertTriangle size={13} />
+        Komentar tidak berhasil di-scrape
+      </div>
+    );
+  }
+
+  if (!post.top_comments?.length) return null;
+
+  const total = post.comments_scraped_count || 0;
+  const otherCount = total - post.top_comments.length;
+
+  return (
+    <div className="mt-4 space-y-2">
+      {/* Header */}
+      <div className="flex items-center gap-1.5 text-xs font-semibold" style={{ color: "#4a5070" }}>
+        <MessageCircle size={13} style={{ color: "#3b6dce" }} />
+        Top Komentar
+        <span style={{ color: "#8890aa", fontWeight: 400 }}>
+          ({post.top_comments.length}{otherCount > 0 ? ` dari ${total}` : ""})
+        </span>
+      </div>
+
+      {/* Comment list */}
+      {post.top_comments.map((c, ci) => (
+        <div
+          key={ci}
+          className="rounded-xl px-3 py-2.5 text-xs space-y-1"
+          style={{ background: "rgba(59,109,206,0.04)", border: "1px solid rgba(59,109,206,0.1)" }}
+        >
+          {/* Author + timestamp */}
+          <div className="flex items-center gap-2">
+            {/* Avatar placeholder */}
+            <div
+              className="flex-shrink-0 rounded-full flex items-center justify-center text-white font-bold"
+              style={{ width: 24, height: 24, fontSize: 10, background: `hsl(${(c.comment_author?.charCodeAt(0) || 0) * 47 % 360}, 60%, 50%)` }}
+            >
+              {(c.comment_author || "?")[0].toUpperCase()}
+            </div>
+            <span className="font-semibold" style={{ color: "#1a1c23" }}>{c.comment_author || "Anonim"}</span>
+            {c.comment_timestamp && (
+              <span style={{ color: "#8890aa" }}>{c.comment_timestamp}</span>
+            )}
+          </div>
+
+          {/* Comment text */}
+          <p className="leading-5 pl-8" style={{ color: "#4a5070" }}>{c.comment_text.slice(0, 300)}</p>
+
+          {/* Likes */}
+          {c.comment_likes > 0 && (
+            <div className="flex items-center gap-1 pl-8" style={{ color: "#8890aa" }}>
+              {/* ✅ FIX: pakai karakter langsung, bukan \u2764 sebagai string */}
+              <Heart size={11} style={{ color: "#e0245e" }} fill="#e0245e" />
+              <span>{fmtNum(c.comment_likes)}</span>
+            </div>
+          )}
+        </div>
+      ))}
+
+      {/* Show more / collapse */}
+      {otherCount > 0 && (
+        <>
+          <button
+            onClick={() => setExpanded(!expanded)}
+            className="flex items-center gap-1.5 text-xs px-2 py-1.5 rounded-lg transition-all hover:bg-black/5 font-medium"
+            style={{ color: "#6b5ec7" }}
+          >
+            {expanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+            {expanded ? "Sembunyikan" : `Lihat ${otherCount} komentar lainnya`}
+          </button>
+
+          {expanded && post.other_comments?.map((c, ci) => (
+            <div
+              key={`o-${ci}`}
+              className="rounded-xl px-3 py-2.5 text-xs space-y-1 ml-4"
+              style={{ background: "rgba(0,0,0,0.025)", border: "1px solid rgba(0,0,0,0.07)" }}
+            >
+              <div className="flex items-center gap-2">
+                <div
+                  className="flex-shrink-0 rounded-full flex items-center justify-center text-white font-bold"
+                  style={{ width: 20, height: 20, fontSize: 9, background: `hsl(${(c.comment_author?.charCodeAt(0) || 0) * 47 % 360}, 55%, 55%)` }}
+                >
+                  {(c.comment_author || "?")[0].toUpperCase()}
+                </div>
+                <span className="font-semibold" style={{ color: "#1a1c23" }}>{c.comment_author || "Anonim"}</span>
+                {c.comment_timestamp && <span style={{ color: "#8890aa" }}>{c.comment_timestamp}</span>}
+              </div>
+              <p className="leading-5 pl-7" style={{ color: "#4a5070" }}>{c.comment_text.slice(0, 300)}</p>
+              {c.comment_likes > 0 && (
+                <div className="flex items-center gap-1 pl-7" style={{ color: "#8890aa" }}>
+                  <Heart size={10} style={{ color: "#e0245e" }} fill="#e0245e" />
+                  <span>{fmtNum(c.comment_likes)}</span>
+                </div>
+              )}
+            </div>
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── PostCard ────────────────────────────────────────────────────────────────
+
+function PostCard({ post, idx }: { post: DeepPost; idx: number }) {
+  const text       = primaryText(post);
+  const domain     = mediaDomain(post.url);
+  const realPost   = isRealPost(post);
+  const hasContent_ = hasContent(post);
+  const hasEngage  = hasEngagement(post);
+  const typeKey    = (post.type?.toLowerCase() || "other") as keyof typeof GROUP_META;
+  const meta       = GROUP_META[typeKey] || GROUP_META.other;
+
+  return (
+    <GlassCard className="overflow-hidden mb-3">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-start">
+        {/* ── Left: Main content ── */}
+        <div className="flex-1 min-w-0 space-y-3">
+
+          {/* Row 1: Badges + rank */}
+          <div className="flex items-center gap-2 flex-wrap">
+            {post.rank && (
+              <span className="text-xs font-bold px-2 py-0.5 rounded-full" style={{ background: "rgba(107,94,199,0.1)", color: "#6b5ec7" }}>
+                #{post.rank}
+              </span>
+            )}
+
+            {/* Type badge */}
+            <span
+              className="flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full uppercase"
+              style={{ background: `${meta.color}18`, color: meta.color }}
+            >
+              {meta.icon}{post.type || "post"}
+            </span>
+
+            {/* Data terbatas badge */}
+            {(!realPost || (!hasContent_ && !hasEngage)) && (
+              <span className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full" style={{ background: "rgba(158,108,10,0.1)", color: "#9e6c0a" }}>
+                <AlertTriangle size={11} /> Data terbatas
+              </span>
+            )}
+
+            {/* Source tag */}
+            {post.deep_source_tag && (
+              <span className="text-xs px-2 py-0.5 rounded-full" style={{ background: "rgba(107,94,199,0.08)", color: "#6b5ec7" }}>
+                #{post.deep_source_tag}
+              </span>
+            )}
+          </div>
+
+          {/* Row 2: Media name + author */}
+          <div className="flex items-center gap-2 flex-wrap">
+            {/* ✅ Nama media dari domain URL */}
+            {(post.group_name || domain) && (
+              <div className="flex items-center gap-1 text-xs font-semibold" style={{ color: "#1a1c23" }}>
+                <Newspaper size={12} style={{ color: "#6b5ec7" }} />
+                {post.group_name || domain}
+              </div>
+            )}
+            {post.author && post.author !== "Unknown" && post.author !== domain && post.author !== post.group_name && (
+              <span className="text-xs" style={{ color: "#8890aa" }}>
+                oleh <span style={{ color: "#4a5070" }}>{post.author}</span>
+              </span>
+            )}
+            {post.type === "groups" && post.group_members && (
+              <span className="text-xs" style={{ color: "#8890aa" }}>{post.group_members}</span>
+            )}
+            {post.timestamp && (
+              <span className="text-xs" style={{ color: "#8890aa" }}>· {post.timestamp}</span>
+            )}
+          </div>
+
+          {/* Row 3: Caption/text */}
+          {hasContent_ ? (
+            <p className="text-sm leading-6 whitespace-pre-wrap break-words" style={{ color: "#1a1c23" }}>
+              {text}
+            </p>
+          ) : (
+            <p className="text-sm italic" style={{ color: "#aab0bf" }}>
+              Konten tidak berhasil ter-extract dari halaman ini
+            </p>
+          )}
+
+          {/* Row 4: Engagement metrics */}
+          {hasEngage ? (
+            <div className="flex flex-wrap items-center gap-3">
+              {(post.likes_count || 0) > 0 && (
+                <span className="flex items-center gap-1.5 text-xs font-medium" style={{ color: "#4a5070" }}>
+                  {/* ✅ FIX: Heart icon dari lucide, bukan \u2764 string */}
+                  <Heart size={14} style={{ color: "#e0245e" }} fill="#e0245e" />
+                  {fmtNum(post.likes_count)}
+                </span>
+              )}
+              {(post.comments_count || 0) > 0 && (
+                <span className="flex items-center gap-1.5 text-xs font-medium" style={{ color: "#4a5070" }}>
+                  <MessageCircle size={14} style={{ color: "#3b6dce" }} />
+                  {fmtNum(post.comments_count)}
+                </span>
+              )}
+              {(post.views_count || 0) > 0 && (
+                <span className="flex items-center gap-1.5 text-xs font-medium" style={{ color: "#4a5070" }}>
+                  <Eye size={14} style={{ color: "#8890aa" }} />
+                  {fmtNum(post.views_count)}
+                </span>
+              )}
+              {/* ✅ FIX: Shares menggunakan Share2 icon */}
+              {(post.shares_count || 0) > 0 && (
+                <span className="flex items-center gap-1.5 text-xs font-medium" style={{ color: "#4a5070" }}>
+                  <Share2 size={14} style={{ color: "#1d7a47" }} />
+                  {fmtNum(post.shares_count)}
+                </span>
+              )}
+            </div>
+          ) : (
+            <div className="flex items-center gap-1.5 text-xs" style={{ color: "#aab0bf" }}>
+              <AlertTriangle size={12} />
+              Engagement belum ter-extract
+            </div>
+          )}
+
+          {/* Row 5: URL */}
+          <div
+            className="rounded-lg px-3 py-2 text-xs break-all font-mono"
+            style={{ background: "rgba(0,0,0,0.025)", color: "#6b5ec7", border: "1px solid rgba(107,94,199,0.12)" }}
+          >
+            {compactUrl(post.url)}
+          </div>
+
+          {/* Row 6: Comments */}
+          <CommentSection post={post} />
+        </div>
+
+        {/* ── Right: Actions ── */}
+        <div className="flex shrink-0 flex-row gap-2 lg:w-36 lg:flex-col">
+          <a
+            href={post.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex-1 lg:flex-none flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium transition-all hover:bg-purple-50"
+            style={{ color: "#6b5ec7", border: "1px solid rgba(107,94,199,0.2)", background: "rgba(107,94,199,0.05)" }}
+          >
+            <ExternalLink size={13} /> Buka FB
+          </a>
+          <DownloadButton
+            data={post}
+            filename={`fb-post-${post.author || "unknown"}-${idx}`}
+            label="Download"
+            className="flex-1 lg:flex-none justify-center px-3 py-2 text-xs"
+          />
+        </div>
+      </div>
+    </GlassCard>
+  );
+}
+
+// ─── Main Page ───────────────────────────────────────────────────────────────
+
+export default function DeepSearchPage() {
+  const { job, isRunning, start, finish, fail } = useScrape();
+
+  const [mode,    setMode]    = usePersistState<DeepMode>("deep-mode",  "keyword");
+  const [query,   setQuery]   = usePersistState("deep-query",           "");
+  const [types,   setTypes]   = usePersistState<string[]>("deep-types", ["posts", "videos", "groups", "pages"]);
+  const [sortBy,  setSortBy]  = usePersistState<"engagement" | "recent">("deep-sort", "engagement");
+  const [maxTotal,            setMaxTotal]            = useState(1000);
+  const [maxCommentsPerPost,  setMaxCommentsPerPost]  = useState(0);
+
+  const [jobId,     setJobId]     = useState<string | null>(null);
+  const [jobState,  setJobState]  = useState<DeepJobState | null>(null);
+  const [posts,     setPosts]     = useState<DeepPost[]>([]);
+  const [loading,   setLoading]   = useState(false);
+  const [error,     setError]     = useState("");
+  const [activeTab, setActiveTab] = useState("all");
+  const [showEmpty, setShowEmpty] = useState(false);
+
+  const [cachedPosts, setCachedPosts] = usePersistState<DeepPost[]>("deep-posts-v2", []);
+
+  const pollRef        = useRef<NodeJS.Timeout | null>(null);
+  const cancelledRef   = useRef(false);
+  const activeJobIdRef = useRef<string | null>(null);
+
+  const isMyJob  = job?.type === "deep";
+  const isMyRun  = isRunning && isMyJob;
+  const otherRun = isRunning && !isMyJob;
+
+  const jobPosts    = job?.type === "deep" && job.status === "done" ? (job.deepPosts as DeepPost[]) : [];
+  const allPosts    = jobPosts.length > 0 ? jobPosts : posts.length > 0 ? posts : cachedPosts;
+
+  // Split: post "nyata" vs post data terbatas
+  const realPosts  = useMemo(() => allPosts.filter(p => isRealPost(p) && (hasContent(p) || hasEngagement(p))), [allPosts]);
+  const limitedPosts = useMemo(() => allPosts.filter(p => !isRealPost(p) || (!hasContent(p) && !hasEngagement(p))), [allPosts]);
+  const displayPosts = showEmpty ? allPosts : (realPosts.length > 0 ? realPosts : allPosts);
+
+  const groups = useMemo(() => groupByType(displayPosts), [displayPosts]);
+
+  const typeOptions = [
+    { value: "posts",   label: "Postingan",   icon: FileText },
+    { value: "videos",  label: "Video/Reels", icon: Video    },
+    { value: "pages",   label: "Halaman",     icon: Users    },
+    { value: "groups",  label: "Grup",        icon: Grid3x3  },
+  ];
+
+  const toggleType = (val: string) => {
+    setTypes(prev => prev.includes(val) ? prev.filter(t => t !== val) : [...prev, val]);
+  };
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+  }, []);
+
+  useEffect(() => {
+    if (!jobId) return;
+    activeJobIdRef.current = jobId;
+    cancelledRef.current   = false;
+
+    const poll = async () => {
+      if (cancelledRef.current || activeJobIdRef.current !== jobId) { stopPolling(); return; }
+      try {
+        const res = await api.deep.jobStatus(jobId);
+        if (!res.data) return;
+        setJobState(res.data);
+
+        if (res.data.status === "running" || res.data.status === "pending") {
+          try {
+            const partialRes = await api.deep.jobPostsPartial(jobId);
+            if (partialRes.data?.posts?.length) {
+              setPosts(partialRes.data.posts);
+              setCachedPosts(partialRes.data.posts);
+            }
+          } catch (e: unknown) { console.warn("Partial fetch error:", errorMessage(e, "unknown")); }
+        }
+
+        if (res.data.status === "completed" || res.data.status === "cancelled") {
+          stopPolling(); setLoading(false);
+          if (res.data.status === "completed") {
+            const postsRes = await api.deep.jobPosts(jobId);
+            if (postsRes.data) {
+              const fp = postsRes.data.posts || [];
+              setPosts(fp); setCachedPosts(fp);
+              finish({ deepPosts: fp, elapsed: undefined });
+            }
+          } else { finish({ deepPosts: [], elapsed: undefined }); }
+        } else if (res.data.status === "error") {
+          stopPolling();
+          setError(res.data.error || "Job error");
+          fail(res.data.error || "Job error");
+          setLoading(false);
+        }
+      } catch (err: unknown) {
+        if (cancelledRef.current || activeJobIdRef.current !== jobId) { stopPolling(); setLoading(false); return; }
+        if (errorMessage(err, "").includes("cancelled")) {
+          stopPolling(); setLoading(false);
+          finish({ deepPosts: [], elapsed: undefined });
+        }
+      }
+    };
+
+    poll();
+    pollRef.current = setInterval(poll, 3000);
+    return () => { stopPolling(); };
+  }, [jobId, finish, fail, setCachedPosts, stopPolling]);
+
+  const handleStart = async () => {
+    if (!query.trim() && mode !== "trending") { setError("Query wajib diisi"); return; }
+    if (isRunning) { setError("Scraping lain sedang berjalan"); return; }
+    setLoading(true); setError(""); setJobId(null); setJobState(null);
+    setPosts([]); setCachedPosts([]); setActiveTab("all"); setShowEmpty(false);
+    cancelledRef.current = false;
+    const label = query || `${mode} search`;
+    start("deep", label);
+    try {
+      let res;
+      if (mode === "keyword") {
+        res = await api.deep.keyword(query, { max_related: 5, max_per_query: 200, max_total: maxTotal, types, max_comments_per_post: maxCommentsPerPost });
+      } else if (mode === "hashtag") {
+        res = await api.deep.hashtag(query, { max_related_hashtags: 10, max_per_query: 300, max_total: maxTotal, max_comments_per_post: maxCommentsPerPost });
+      } else {
+        res = await api.deep.trending({ keyword: query, sort_by: sortBy, types, max_total: maxTotal, max_comments_per_post: maxCommentsPerPost });
+      }
+      if (res.data?.job_id) setJobId(res.data.job_id);
+      else throw new Error("Job ID tidak diterima");
+    } catch (err: unknown) {
+      const msg = errorMessage(err, "Gagal memulai deep search");
+      setError(msg); setLoading(false); fail(msg);
+    }
+  };
+
+  const handleCancel = async () => {
+    if (!jobId || cancelledRef.current) return;
+    cancelledRef.current = true; stopPolling();
+    try {
+      await api.deep.cancelJob(jobId);
+      setJobState(prev => prev ? { ...prev, status: "cancelled" } : null);
+      setLoading(false);
+      finish({ deepPosts: [], elapsed: undefined });
+    } catch {
+      setLoading(false);
+      finish({ deepPosts: [], elapsed: undefined });
+    }
+  };
+
+  const handleReset = () => {
+    stopPolling(); setJobId(null); setJobState(null); setPosts([]);
+    setCachedPosts([]); setError(""); setLoading(false); setShowEmpty(false);
+    cancelledRef.current = false; activeJobIdRef.current = null;
+  };
+
+  const statusIcon = () => {
+    if (!jobState) return null;
+    switch (jobState.status) {
+      case "pending":   return <Clock        size={15} style={{ color: "#8890aa" }} />;
+      case "running":   return <Loader2      size={15} style={{ color: "#3b6dce" }} className="animate-spin" />;
+      case "completed": return <CheckCircle  size={15} style={{ color: "#1d7a47" }} />;
+      case "cancelled": return <XCircle      size={15} style={{ color: "#9e6c0a" }} />;
+      case "error":     return <AlertCircle  size={15} style={{ color: "#c0394f" }} />;
+      default:          return null;
+    }
+  };
+
+  const tabKeys = ["all", ...Object.keys(groups).filter(k => groups[k as keyof typeof groups].length > 0)];
+  const showCommentWarning = isMyRun && maxCommentsPerPost > 0 && maxTotal > 50;
+
+  return (
+    <div className="p-6 max-w-7xl mx-auto space-y-6">
+
+      {/* Header */}
+      <div>
+        <h1 className="text-2xl font-bold gradient-text flex items-center gap-2">
+          <Search size={24} style={{ color: "#6b5ec7" }} /> Deep Search
+        </h1>
+        <p className="text-sm mt-1" style={{ color: "#8890aa" }}>
+          Pencarian mendalam: scrape + expand ke related keywords / hashtags.
+        </p>
+      </div>
+
+      {/* Other scrape warning */}
+      {otherRun && (
+        <GlassCard glow="purple">
+          <div className="flex items-center gap-3">
+            <Loader2 size={15} style={{ color: "#6b5ec7" }} className="animate-spin shrink-0" />
+            <p className="text-sm" style={{ color: "#6b5ec7" }}>Scraping lain sedang berjalan ({job?.label}).</p>
+          </div>
+        </GlassCard>
+      )}
+
+      {/* Mode Tabs */}
+      <div className="glass rounded-2xl p-2 flex gap-2">
+        {(["keyword", "hashtag", "trending"] as DeepMode[]).map(m => {
+          const active = mode === m;
+          const Icon   = m === "keyword" ? Search : m === "hashtag" ? Hash : TrendingUp;
+          return (
+            <button
+              key={m} onClick={() => setMode(m)}
+              className={`flex-1 flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-sm font-medium transition-all ${active ? "shadow-sm" : "hover:bg-black/5"}`}
+              style={{ background: active ? "rgba(107,94,199,0.1)" : "transparent", color: active ? "#6b5ec7" : "#4a5070" }}
+            >
+              <Icon size={15} />{m.charAt(0).toUpperCase() + m.slice(1)}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Form */}
+      <div className="glass rounded-2xl p-6 space-y-4">
+        {mode !== "trending" && (
+          <div>
+            <label className="text-sm font-medium mb-1 block" style={{ color: "#4a5070" }}>
+              {mode === "keyword" ? "Keyword" : "Hashtag (tanpa #)"}
+            </label>
+            <input
+              type="text" value={query} onChange={e => setQuery(e.target.value)}
+              placeholder={mode === "keyword" ? 'Contoh: "jokowi"' : 'Contoh: "pertamina"'}
+              className="glass-input w-full px-4 py-3 text-sm" disabled={isMyRun}
+            />
+          </div>
+        )}
+
+        {mode === "trending" && (
+          <>
+            <div>
+              <label className="text-sm font-medium mb-1 block" style={{ color: "#4a5070" }}>Keyword (Opsional)</label>
+              <input type="text" value={query} onChange={e => setQuery(e.target.value)} placeholder="Kosongkan untuk scrape semua trending" className="glass-input w-full px-4 py-3 text-sm" disabled={isMyRun} />
+            </div>
+            <div>
+              <label className="text-sm font-medium mb-2 block" style={{ color: "#4a5070" }}>Sort By</label>
+              <div className="flex gap-2">
+                {(["engagement", "recent"] as const).map(s => (
+                  <button key={s} onClick={() => setSortBy(s)} disabled={isMyRun}
+                    className="flex-1 px-4 py-2.5 rounded-xl text-sm font-medium transition-all"
+                    style={{ background: sortBy === s ? "rgba(192,57,79,0.1)" : "rgba(0,0,0,0.04)", color: sortBy === s ? "#c0394f" : "#4a5070", border: sortBy === s ? "1px solid rgba(192,57,79,0.25)" : "1px solid transparent" }}
+                  >
+                    {s === "engagement" ? "Engagement" : "Terbaru"}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </>
+        )}
+
+        {mode !== "hashtag" && (
+          <div>
+            <label className="text-sm font-medium mb-2 block" style={{ color: "#4a5070" }}>Tipe Konten</label>
+            <div className="flex flex-wrap gap-2">
+              {typeOptions.map(opt => {
+                const active = types.includes(opt.value);
+                const I = opt.icon;
+                return (
+                  <button
+                    key={opt.value} onClick={() => toggleType(opt.value)} disabled={isMyRun}
+                    className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-medium transition-all"
+                    style={{ background: active ? "rgba(107,94,199,0.1)" : "rgba(0,0,0,0.04)", color: active ? "#6b5ec7" : "#4a5070", border: active ? "1px solid rgba(107,94,199,0.25)" : "1px solid transparent" }}
+                  >
+                    <I size={14} />{opt.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        <div className="flex gap-4 flex-wrap">
+          <div>
+            <label className="text-sm font-medium mb-1 block" style={{ color: "#4a5070" }}>Max Total Posts</label>
+            <input type="number" value={maxTotal} onChange={e => setMaxTotal(Math.min(5000, Math.max(100, parseInt(e.target.value) || 100)))} disabled={isMyRun} className="glass-input w-28 px-4 py-2 text-sm" />
+          </div>
+          <div>
+            <label className="text-sm font-medium mb-1 block" style={{ color: "#4a5070" }}>Komentar per Post</label>
+            <input type="number" value={maxCommentsPerPost} onChange={e => setMaxCommentsPerPost(Math.min(50, Math.max(0, parseInt(e.target.value) || 0)))} disabled={isMyRun} className="glass-input w-28 px-4 py-2 text-sm" />
+            <p className="text-xs mt-1" style={{ color: "#8890aa" }}>0 = skip (lebih cepat)</p>
+          </div>
+        </div>
+
+        {showCommentWarning && (
+          <div className="p-3 rounded-xl text-xs flex items-center gap-2" style={{ background: "rgba(192,57,79,0.06)", border: "1px solid rgba(192,57,79,0.15)", color: "#c0394f" }}>
+            <AlertTriangle size={13} className="shrink-0" />
+            Scraping komentar akan menambah waktu signifikan per post
+          </div>
+        )}
+
+        {/* Buttons */}
+        <div className="flex gap-2">
+          {!loading && !jobId && (
+            <button onClick={handleStart} disabled={isRunning}
+              className="btn-primary flex-1 flex items-center justify-center gap-2 py-3">
+              <Play size={18} /> Mulai Deep Search
+            </button>
+          )}
+          {loading && (
+            <button onClick={handleCancel}
+              className="flex-1 py-3 rounded-xl flex items-center justify-center gap-2 font-semibold transition-all text-white"
+              style={{ background: "#c0394f" }}>
+              <Square size={18} /> Cancel Job
+            </button>
+          )}
+          {jobState && ["completed", "error", "cancelled"].includes(jobState.status) && (
+            <button onClick={handleReset}
+              className="flex-1 py-3 rounded-xl flex items-center justify-center gap-2 font-semibold transition-all"
+              style={{ background: "rgba(0,0,0,0.05)", color: "#4a5070" }}>
+              <RefreshCw size={18} /> Reset
+            </button>
+          )}
+        </div>
+
+        {isMyRun && (
+          <div className="flex items-center gap-2 text-xs px-3 py-2.5 rounded-xl" style={{ background: "rgba(107,94,199,0.06)", border: "1px solid rgba(107,94,199,0.15)", color: "#6b5ec7" }}>
+            <Loader2 size={12} className="animate-spin shrink-0" /> Deep search berjalan di background...
+          </div>
+        )}
+      </div>
+
+      {/* Error */}
+      {error && (
+        <div className="p-4 rounded-xl flex items-center gap-2" style={{ background: "rgba(192,57,79,0.06)", border: "1px solid rgba(192,57,79,0.15)", color: "#c0394f" }}>
+          <AlertCircle size={15} /> {error}
+        </div>
+      )}
+
+      {/* Job Status */}
+      {jobState && (
+        <div className="glass rounded-2xl p-6 space-y-4">
+          <div className="flex items-center gap-3">
+            {statusIcon()}
+            <div>
+              <h2 className="text-base font-bold" style={{ color: "#1a1c23" }}>
+                {jobState.mode} — {jobState.query || "(trending)"}
+              </h2>
+              <p className="text-xs" style={{ color: "#8890aa" }}>
+                Status: <span className="font-mono">{jobState.status}</span>
+                {" "}· Fetched: {jobState.total_fetched}
+                {" "}· Ditampilkan: {displayPosts.length}
+                {limitedPosts.length > 0 && !showEmpty && ` (${limitedPosts.length} data terbatas disembunyikan)`}
+              </p>
+            </div>
+          </div>
+
+          {jobState.progress_log?.length > 0 && (
+            <div className="rounded-xl p-4 max-h-52 overflow-y-auto font-mono text-xs space-y-0.5" style={{ background: "rgba(0,0,0,0.02)", border: "1px solid rgba(0,0,0,0.06)" }}>
+              {jobState.progress_log.map((log, idx) => (
+                <div key={idx} className="py-0.5" style={{ color: "#4a5070" }}>{log}</div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Results */}
+      {allPosts.length > 0 && (
+        <>
+          {/* Show empty toggle */}
+          {limitedPosts.length > 0 && (
+            <div className="flex items-center justify-between px-1">
+              <p className="text-xs" style={{ color: "#8890aa" }}>
+                {limitedPosts.length} hasil dengan data terbatas (caption/engagement kosong)
+              </p>
+              <button
+                onClick={() => setShowEmpty(v => !v)}
+                className="text-xs px-3 py-1.5 rounded-lg font-medium transition-all hover:bg-black/5"
+                style={{ color: "#6b5ec7" }}
+              >
+                {showEmpty ? "Sembunyikan" : "Tampilkan semua"}
+              </button>
+            </div>
+          )}
+
+          {/* Tab filter */}
+          <div className="glass rounded-2xl p-2 flex gap-1 flex-wrap">
+            {tabKeys.map(k => {
+              const count = k === "all" ? displayPosts.length : groups[k as keyof typeof groups]?.length || 0;
+              const meta  = k === "all"
+                ? { label: "Semua", color: "#6b5ec7", icon: <Search size={13} /> }
+                : GROUP_META[k] || { label: k, color: "#8890aa", icon: <Search size={13} /> };
+              const active = activeTab === k;
+              return (
+                <button
+                  key={k} onClick={() => setActiveTab(k)}
+                  className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-all"
+                  style={{
+                    background: active ? `${meta.color}15` : "transparent",
+                    color: active ? meta.color : "#4a5070",
+                    border: active ? `1px solid ${meta.color}30` : "1px solid transparent",
+                  }}
+                >
+                  {meta.icon}<span>{meta.label}</span>
+                  <span className="opacity-60">({count})</span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="flex justify-end">
+            <DownloadButton data={displayPosts} filename={`fb-deep-${query || "search"}-${new Date().toISOString().slice(0, 10)}`} label="Download Semua Hasil" />
+          </div>
+
+          {/* Post list */}
+          {tabKeys.filter(k => activeTab === "all" || k === activeTab).map(k => {
+            if (activeTab !== "all" && k !== activeTab) return null;
+            const items = k === "all" ? displayPosts : groups[k as keyof typeof groups] || [];
+            if (!items.length) return null;
+            const meta  = k === "all" ? { label: "Semua", color: "#6b5ec7" } : GROUP_META[k] || { label: k, color: "#8890aa" };
+            return (
+              <div key={k}>
+                <h2 className="text-base font-bold mb-3 flex items-center gap-2" style={{ color: meta.color }}>
+                  {meta.label}
+                  <span className="text-sm font-normal opacity-60">({items.length})</span>
+                </h2>
+                {items.map((post, idx) => (
+                  <PostCard key={post.url || `${k}-${idx}`} post={post} idx={idx} />
+                ))}
+              </div>
+            );
+          })}
+        </>
+      )}
+
+      {/* Loading state */}
+      {loading && jobState?.status === "running" && displayPosts.length === 0 && (
+        <div className="text-center py-12" style={{ color: "#8890aa" }}>
+          <Loader2 size={28} className="animate-spin mx-auto mb-3" style={{ color: "#6b5ec7" }} />
+          <p className="text-sm font-medium">Mengumpulkan hasil pertama...</p>
+          <p className="text-xs mt-1">Biasanya membutuhkan 30–60 detik</p>
+        </div>
+      )}
+    </div>
+  );
+}

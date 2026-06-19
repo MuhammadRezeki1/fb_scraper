@@ -1,0 +1,9 @@
+{
+  "pythonVersion": "3.10",
+  "extraPaths": ["backend"],
+  "exclude": ["venv", "frontend", "node_modules"],
+  "reportMissingImports": "warning",
+  "reportMissingModuleSource": "none",
+  "reportCallIssue": "none",
+  "reportArgumentType": "none"
+}
