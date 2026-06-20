@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import { useRouter } from "next/navigation";
 import {
   FileText, Users, RefreshCw, Eye, MessageSquare,
   AlertTriangle, Download, Calendar, Filter,
@@ -14,6 +15,8 @@ import GlassCard from "@/components/ui/GlassCard";
 import LoadingSpinner from "@/components/ui/LoadingSpinner";
 import StatusBadge from "@/components/ui/StatusBadge";
 import { api, DashboardData, RecentPost, RecentProfile, Comment } from "@/lib/api";
+import { useScrape } from "@/contexts/ScrapeContext";
+import { downloadJSON, downloadCSV } from "@/lib/download";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function fmtNum(n: number | undefined) {
@@ -46,7 +49,7 @@ function SentimentBar({ label, pct, color }: { label: string; pct: number; color
 }
 
 // ─── Post row (expandable) ────────────────────────────────────────────────────
-function PostRow({ post, idx }: { post: RecentPost; idx: number }) {
+function PostRow({ post, idx, onScrapePost, isRunning }: { post: RecentPost; idx: number; onScrapePost: (url: string) => void; isRunning: boolean }) {
   const [open, setOpen] = useState(false);
   const s = post.sentiment_summary;
 
@@ -141,16 +144,27 @@ function PostRow({ post, idx }: { post: RecentPost; idx: number }) {
                   {post.url && (
                     <div>
                       <p className="text-xs font-semibold uppercase tracking-wider mb-1" style={{ color: "#8890aa" }}>URL</p>
-                      <a
-                        href={post.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-xs break-all flex items-center gap-1"
-                        style={{ color: "#3b6dce" }}
-                      >
-                        <Globe size={11} />
-                        {post.url.slice(0, 80)}…
-                      </a>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <a
+                          href={post.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-xs break-all flex items-center gap-1"
+                          style={{ color: "#3b6dce" }}
+                        >
+                          <Globe size={11} />
+                          {post.url.slice(0, 80)}…
+                        </a>
+                        <button
+                          onClick={() => onScrapePost(post.url!)}
+                          disabled={isRunning}
+                          title={isRunning ? "Tunggu scraping selesai dulu" : "Scrape postingan ini"}
+                          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all hover:bg-green-50 shrink-0"
+                          style={{ background: "rgba(29,122,71,0.07)", color: "#1d7a47", border: "1px solid rgba(29,122,71,0.2)", opacity: isRunning ? 0.5 : 1, cursor: isRunning ? "not-allowed" : "pointer" }}
+                        >
+                          <FileText size={12} /> Scrape Post
+                        </button>
+                      </div>
                     </div>
                   )}
                   {post.caption && (
@@ -240,11 +254,18 @@ function ProfileRow({ profile, idx }: { profile: RecentProfile; idx: number }) {
 
 // ─── Main page ────────────────────────────────────────────────────────────────
 export default function ResultsPage() {
+  const router = useRouter();
+  const { isRunning, setAutoFillUrl } = useScrape();
   const [data, setData]         = useState<DashboardData | null>(null);
   const [loading, setLoading]   = useState(true);
   const [tab, setTab]           = useState<TabType>("posts");
   const [search, setSearch]     = useState("");
   const [error, setError]       = useState<string | null>(null);
+
+  const handleScrapePost = useCallback((url: string) => {
+    setAutoFillUrl(url);
+    router.push("/scrape/posts");
+  }, [setAutoFillUrl, router]);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -287,14 +308,52 @@ export default function ResultsPage() {
             Lihat dan telusuri semua hasil scraping yang tersimpan
           </p>
         </div>
-        <button
-          onClick={fetchData}
-          disabled={loading}
-          className="btn-glass flex items-center gap-2 px-4 py-2 text-sm"
-        >
-          <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
-          Refresh
-        </button>
+        <div className="flex items-center gap-2 flex-wrap">
+          {tab === "posts" && posts.length > 0 && (
+            <>
+              <button
+                onClick={() => downloadJSON(posts, `fb-results-posts-${new Date().toISOString().slice(0,10)}`)}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium transition-all hover:bg-purple-50"
+                style={{ background: "rgba(107,94,199,0.07)", color: "#6b5ec7", border: "1px solid rgba(107,94,199,0.2)" }}
+              >
+                <FileText size={13} /> JSON
+              </button>
+              <button
+                onClick={() => downloadCSV(posts, `fb-results-posts-${new Date().toISOString().slice(0,10)}`)}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium transition-all hover:bg-green-50"
+                style={{ background: "rgba(29,122,71,0.07)", color: "#1d7a47", border: "1px solid rgba(29,122,71,0.2)" }}
+              >
+                <Download size={13} /> CSV
+              </button>
+            </>
+          )}
+          {tab === "profiles" && profiles.length > 0 && (
+            <>
+              <button
+                onClick={() => downloadJSON(profiles, `fb-results-profiles-${new Date().toISOString().slice(0,10)}`)}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium transition-all hover:bg-purple-50"
+                style={{ background: "rgba(107,94,199,0.07)", color: "#6b5ec7", border: "1px solid rgba(107,94,199,0.2)" }}
+              >
+                <FileText size={13} /> JSON
+              </button>
+              <button
+                onClick={() => downloadCSV(profiles, `fb-results-profiles-${new Date().toISOString().slice(0,10)}`)}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium transition-all hover:bg-green-50"
+                style={{ background: "rgba(29,122,71,0.07)", color: "#1d7a47", border: "1px solid rgba(29,122,71,0.2)" }}
+              >
+                <Download size={13} /> CSV
+              </button>
+            </>
+          )}
+          <button
+            onClick={fetchData}
+            disabled={loading}
+            className="btn-glass flex items-center gap-2 px-4 py-2 text-sm"
+          >
+            <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
+            Refresh
+          </button>
+        </div>
       </div>
 
       {error && (
@@ -408,7 +467,7 @@ export default function ResultsPage() {
                         </td>
                       </tr>
                     ) : (
-                      posts.map((p, i) => <PostRow key={p.filename} post={p} idx={i} />)
+                      posts.map((p, i) => <PostRow key={p.filename} post={p} idx={i} onScrapePost={handleScrapePost} isRunning={isRunning} />)
                     )}
                   </tbody>
                 </table>

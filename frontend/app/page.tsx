@@ -3,10 +3,9 @@
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import {
-  Activity, FileText, Users, Database, CheckCircle, XCircle,
-  ArrowRight, TrendingUp, Shield, RefreshCw, AlertCircle,
-  MessageSquare, Smile, AlertTriangle, Clock, Globe,
-  Zap, BarChart2, ChevronRight,
+  Activity, FileText, Users, Database,
+  TrendingUp, Shield, RefreshCw, AlertCircle,
+  Clock, BarChart2, ChevronRight,
 } from "lucide-react";
 import {
   PieChart, Pie, Cell, Tooltip, ResponsiveContainer, Legend,
@@ -14,7 +13,7 @@ import {
 } from "recharts";
 import GlassCard from "@/components/ui/GlassCard";
 import LoadingSpinner from "@/components/ui/LoadingSpinner";
-import { api, DashboardData, RecentPost, RecentProfile } from "@/lib/api";
+import { api, DashboardData } from "@/lib/api";
 
 const TXT_SEC = { color: "#4a5070" };
 const TXT_MUT = { color: "#8890aa" };
@@ -81,7 +80,10 @@ export default function DashboardPage() {
     }
   }, []);
 
-  useEffect(() => { fetchData(); }, [fetchData]);
+  useEffect(() => {
+    const id = window.setTimeout(() => { void fetchData(); }, 0);
+    return () => window.clearTimeout(id);
+  }, [fetchData]);
 
   const sentPie = data?.latest_sentiment
     ? [
@@ -263,7 +265,7 @@ export default function DashboardPage() {
               {[
                 { href: "/scrape/posts", icon: FileText, label: "Scrape Post", color: "#6b5ec7" },
                 { href: "/scrape/profiles", icon: Users, label: "Scrape Profil", color: "#3b6dce" },
-                { href: "/monitor/keyword", icon: Activity, label: "Keyword Monitor", color: "#2193b0" },
+                { href: "/monitor/deep", icon: Activity, label: "Deep Search", color: "#2193b0" },
                 { href: "/analytics", icon: TrendingUp, label: "Growth Analytics", color: "#1d7a47" },
               ].map(({ href, icon: Icon, label, color }) => (
                 <Link key={href} href={href}>

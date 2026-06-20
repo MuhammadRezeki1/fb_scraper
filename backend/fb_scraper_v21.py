@@ -34,6 +34,9 @@ PROXY                  = os.getenv("FB_PROXY", "")
 MAX_COMMENTS           = int(os.getenv("FB_MAX_COMMENTS", 200))
 DELAY_BETWEEN_REQUESTS = int(os.getenv("FB_DELAY_BETWEEN_REQUESTS", 10))
 SENTIMENT_MODE         = os.getenv("SENTIMENT_MODE", "hybrid")
+SCRAPE_REACTORS        = os.getenv("FB_SCRAPE_REACTORS", "0") == "1"
+MAX_REACTORS           = int(os.getenv("FB_MAX_REACTORS", 200))
+ALL_COMMENTS_FALLBACK_TARGET = int(os.getenv("FB_ALL_COMMENTS_FALLBACK_TARGET", 3000))
 
 FB_CHROME_PROFILE = os.path.join(os.getcwd(), "fb_chrome_real_profile")
 OUTPUT_DIR        = "output_facebook"
@@ -535,8 +538,31 @@ class FacebookScraperV21:
                     if (m) out.comments_raw = m[1];
                 }
                 if (!out.shares_raw) {
-                    const m = bodyText.match(/([\d][\d.,]*\s*(?:rb|jt)?)\s*(?:kali dibagikan|x dibagikan|dibagikan|shares?)/i);
-                    if (m) out.shares_raw = m[1];
+                    // Coba berbagai pola shares di halaman post
+                    const sharePatterns = [
+                        /([\d][\d.,]*\s*(?:rb|jt)?)\s*(?:kali\s+dibagikan|x\s+dibagikan)/i,
+                        /([\d][\d.,]*\s*(?:rb|jt)?)\s*dibagikan/i,
+                        /dibagikan\s+([\d][\d.,]*\s*(?:rb|jt)?)\s*kali/i,
+                        /([\d][\d.,]*\s*(?:rb|jt)?)\s*shares?/i,
+                    ];
+                    for (const pat of sharePatterns) {
+                        const m = bodyText.match(pat);
+                        if (m) { out.shares_raw = m[1]; break; }
+                    }
+                }
+                // Coba juga dari aria-label tombol share di dalam article
+                if (!out.shares_raw) {
+                    document.querySelectorAll('[aria-label]').forEach(el => {
+                        if (out.shares_raw) return;
+                        const a = (el.getAttribute('aria-label') || '').toLowerCase();
+                        if (a.includes('bagikan') || a.includes('share')) {
+                            // Kadang ada angka di teks elemennya
+                            const t = (el.innerText || '').trim();
+                            if (t && /^\d/.test(t) && t.length < 12) {
+                                out.shares_raw = t;
+                            }
+                        }
+                    });
                 }
 
                 // ── Caption ──
@@ -684,6 +710,125 @@ class FacebookScraperV21:
         return extras
 
     # ── REEL/VIDEO: BUKA PANEL KOMENTAR ──────────────────────────
+
+    def _scrape_post_reactors(self, max_reactors: int = MAX_REACTORS) -> List[Dict]:
+        """
+        Best-effort scrape akun yang muncul di dialog reaction.
+        Facebook hanya menampilkan nama yang berhasil dimuat di DOM.
+        """
+        if max_reactors <= 0:
+            return []
+
+        print(Fore.CYAN + f"\n   [REACTIONS] Membuka daftar reaction (limit: {max_reactors})...")
+        try:
+            clicked = self.pg.evaluate(r"""() => {
+                const bad = /(komentar|comment|bagikan|share|kirim|send|balas|reply)/i;
+                const good = /(semua reaksi|all reactions|suka:|like:|reaksi|reaction|people reacted|orang)/i;
+                const candidates = [];
+                document.querySelectorAll('[aria-label], a[href], [role="button"]').forEach(el => {
+                    const aria = el.getAttribute('aria-label') || '';
+                    const text = (el.innerText || el.textContent || '').trim();
+                    const combined = `${aria} ${text}`.trim();
+                    if (!combined || bad.test(combined) || !good.test(combined) || !/\d|rb|ribu|k|jt|juta/i.test(combined)) return;
+                    const target = el.closest('a[href], [role="button"]') || el;
+                    const rect = target.getBoundingClientRect();
+                    if (rect.width < 4 || rect.height < 4) return;
+                    candidates.push({ target, score: aria.length < 120 ? 2 : 1 });
+                });
+                candidates.sort((a, b) => b.score - a.score);
+                const chosen = candidates[0]?.target;
+                if (!chosen) return false;
+                chosen.scrollIntoView({ block: 'center', behavior: 'auto' });
+                chosen.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                return true;
+            }""")
+            if not clicked:
+                print(Fore.YELLOW + "   [REACTIONS] Tombol reaction tidak ditemukan")
+                return []
+
+            time.sleep(2.5)
+            reactors: List[Dict] = []
+            seen = set()
+            stable = 0
+
+            max_rounds = max(40, min(140, max_reactors // 8 + 30))
+            for _ in range(max_rounds):
+                batch = self.pg.evaluate(r"""(limit) => {
+                    const clean = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                    const badName = /(tambahkan teman|add friend|ikuti|follow|mengikuti|message|pesan|lihat profil|view profile|teman bersama|mutual|reaction|reaksi|suka|like)$/i;
+                    const badUrl = /(\/help\/|\/privacy\/|\/legal\/|\/groups\/|\/events\/|\/watch\/|\/reel\/|\/videos\/|\/photo|\/posts\/|\/permalink\/|\/ufi\/reaction)/i;
+                    const dialog = Array.from(document.querySelectorAll('[role="dialog"]')).pop() || document.body;
+                    const rows = [];
+                    const anchors = [...dialog.querySelectorAll('a[href]')];
+                    anchors.forEach(a => {
+                        const href = a.href || a.getAttribute('href') || '';
+                        if (!href || !href.includes('facebook.com') || badUrl.test(href)) return;
+                        const lines = clean(a.innerText || a.textContent || '')
+                            .split(/\n+/).map(clean).filter(Boolean);
+                        const name = lines.find(line =>
+                            line.length >= 2 &&
+                            line.length <= 90 &&
+                            !badName.test(line) &&
+                            !/^\d/.test(line) &&
+                            !line.includes('facebook.com')
+                        );
+                        if (!name) return;
+                        rows.push({
+                            name,
+                            profile_url: href.split('?')[0].split('#')[0],
+                            reaction_type: '',
+                        });
+                    });
+                    return rows.slice(0, limit);
+                }""", max_reactors)
+
+                added = 0
+                for item in batch:
+                    key = (item.get("profile_url") or item.get("name") or "").lower()
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    reactors.append(item)
+                    added += 1
+                    if len(reactors) >= max_reactors:
+                        break
+                if len(reactors) >= max_reactors:
+                    break
+
+                scrolled = self.pg.evaluate(r"""() => {
+                    const dialog = Array.from(document.querySelectorAll('[role="dialog"]')).pop();
+                    if (!dialog) return false;
+                    let moved = false;
+                    let best = null, roomBest = 0;
+                    [dialog, ...dialog.querySelectorAll('*')].forEach(el => {
+                        const s = getComputedStyle(el);
+                        if ((s.overflowY === 'auto' || s.overflowY === 'scroll' || el === dialog) && el.scrollHeight > el.clientHeight + 50) {
+                            const room = el.scrollHeight - el.scrollTop - el.clientHeight;
+                            if (room > roomBest) { roomBest = room; best = el; }
+                        }
+                    });
+                    if (best && roomBest > 2) {
+                        best.scrollTop = Math.min(best.scrollHeight, best.scrollTop + Math.max(500, best.clientHeight * 0.95));
+                        moved = true;
+                    }
+                    dialog.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: 900 }));
+                    window.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: 900 }));
+                    return moved || roomBest > 2;
+                }""")
+                stable = stable + 1 if added == 0 else 0
+                if stable >= 8 or (not scrolled and stable >= 3):
+                    break
+                time.sleep(0.8 if added == 0 else 0.45)
+
+            try:
+                self.pg.keyboard.press("Escape")
+            except Exception:
+                pass
+            print(Fore.GREEN + f"   [REACTIONS] {len(reactors)} akun")
+            return reactors[:max_reactors]
+        except Exception as e:
+            print(Fore.YELLOW + f"   [REACTIONS] gagal: {e}")
+            return []
 
     def _open_reel_comments(self) -> bool:
         """
@@ -914,7 +1059,8 @@ class FacebookScraperV21:
 
         return accumulated
 
-    def _scroll_to_load_comments(self, target_count: int, include_replies: bool = True) -> List[Dict]:
+    def _scroll_to_load_comments(self, target_count: int, include_replies: bool = True,
+                                 target_total_items: bool = False) -> List[Dict]:
         """
         Scroll + ekstraksi per-round, akumulasi hasil (anti-virtualization).
         Mengembalikan list komentar gabungan (sudah dedup).
@@ -922,7 +1068,7 @@ class FacebookScraperV21:
         print(Fore.CYAN + f"\n📜 Scroll untuk load komentar (target: {target_count})...")
 
         accumulated: List[Dict] = []
-        last_top_level = 0
+        last_progress = 0
         stable_rounds  = 0
         is_all         = target_count >= 5000
         max_stable     = 8 if is_all else 5
@@ -953,20 +1099,21 @@ class FacebookScraperV21:
                 pass
 
             top_level_now = sum(1 for c in accumulated if not c.get("is_reply"))
+            progress_now = len(accumulated) if target_total_items else top_level_now
 
-            if top_level_now > last_top_level:
+            if progress_now > last_progress:
                 print(Fore.CYAN + f"   📄 Round {scroll_round}: {top_level_now} komentar utama "
                                    f"({len(accumulated)} total termasuk balasan)")
-                last_top_level = top_level_now
+                last_progress = progress_now
                 stable_rounds = 0
-                if top_level_now >= target_count:
+                if progress_now >= target_count:
                     print(Fore.GREEN + f"   🎯 Target {target_count} komentar tercapai")
                     break
             else:
                 stable_rounds += 1
                 # Rate-limit terdeteksi → warm-up lebih panjang
                 rate_limited = self._detect_rate_limit()
-                if (stable_rounds >= max_stable or rate_limited) and top_level_now < target_count:
+                if (stable_rounds >= max_stable or rate_limited) and progress_now < target_count:
                     if warmups_done < max_warmups:
                         warmups_done += 1
                         stable_rounds = 0
@@ -1433,7 +1580,8 @@ class FacebookScraperV21:
     # ============================================================
 
     def scrape_post(self, post_url: str, max_comments: int = MAX_COMMENTS,
-                    include_replies: bool = True) -> Dict:
+                    include_replies: bool = True, scrape_reactors: bool = SCRAPE_REACTORS,
+                    max_reactors: int = MAX_REACTORS) -> Dict:
         print(Fore.CYAN + "\n" + "=" * 70)
         print(Fore.CYAN + f"📝 {post_url[:70]}")
         print(Fore.CYAN + "=" * 70)
@@ -1454,6 +1602,9 @@ class FacebookScraperV21:
             "media_urls":        [],
             "location":          "",
             "total_likes":       0,
+            "reactors":          [],
+            "reactors_count":    0,
+            "reactors_scrape_failed": False,
             "total_comments":    0,
             "total_shares":      0,
             "total_saves":       None,   # FB tidak mengekspos jumlah save ke publik
@@ -1540,6 +1691,14 @@ class FacebookScraperV21:
             if result["media_type"]:
                 print(Fore.CYAN + f"   🖼️  Media      : {result['media_type']} ({result['media_count']})")
 
+            if scrape_reactors:
+                reactors = self._scrape_post_reactors(max_reactors)
+                result["reactors"] = reactors
+                result["reactors_count"] = len(reactors)
+                if not reactors and result.get("total_likes", 0) > 0:
+                    result["reactors_scrape_failed"] = True
+                self._open_reel_comments()
+
             if result["caption"]:
                 print(Fore.CYAN + f"\n📝 Caption: {result['caption'][:150]}")
                 print(Fore.CYAN + "\n🧠 Analyzing caption sentiment...")
@@ -1548,7 +1707,19 @@ class FacebookScraperV21:
                 self._display_caption_box(result["caption"], cap_sent["category"], cap_sent)
 
             # Scroll + akumulasi komentar per-round (anti‑virtualization)
-            raw_comments = self._scroll_to_load_comments(max_comments, include_replies=include_replies)
+            target_total_items = max_comments >= 5000
+            comment_target = max_comments
+            if target_total_items and result.get("total_comments", 0) > 0:
+                comment_target = min(max_comments, max(1, int(result["total_comments"])))
+                print(Fore.CYAN + f"   [COMMENTS] Target disesuaikan dari {max_comments:,} ke {comment_target:,} berdasarkan total komentar post")
+            elif target_total_items:
+                comment_target = min(max_comments, ALL_COMMENTS_FALLBACK_TARGET)
+                print(Fore.YELLOW + f"   [COMMENTS] Total komentar tidak terbaca, pakai fallback target {comment_target:,}")
+            raw_comments = self._scroll_to_load_comments(
+                comment_target,
+                include_replies=include_replies,
+                target_total_items=target_total_items,
+            )
             raw_comments = self._dedup_comments(raw_comments)
             print(Fore.GREEN + f"\n✅ Setelah dedup: {len(raw_comments)} komentar unik")
 
@@ -1726,9 +1897,49 @@ class FacebookScraperV21:
                 "sentiment": c.get("sentiment", ""), "number": c.get("number", 0),
             })
 
-        commenter_stats = Counter([c["username"] for c in comments])
-        most_active = [{"username": u, "count": n}
-                       for u, n in commenter_stats.most_common(5) if n > 1]
+        active_map = {}
+        for c in comments:
+            username = c.get("username") or "Unknown"
+            item = active_map.setdefault(username, {
+                "username": username,
+                "count": 0,
+                "comments_count": 0,
+                "replies_count": 0,
+                "reply_targets": Counter(),
+                "total_likes": 0,
+                "examples": [],
+            })
+            is_reply = bool(c.get("is_reply"))
+            item["count"] += 1
+            item["replies_count" if is_reply else "comments_count"] += 1
+            item["total_likes"] += int(c.get("like_count", 0) or 0)
+            if is_reply and c.get("reply_to"):
+                item["reply_targets"][c.get("reply_to")] += 1
+            if len(item["examples"]) < 3:
+                item["examples"].append({
+                    "number": c.get("number", 0),
+                    "text": (c.get("text") or "")[:260],
+                    "is_reply": is_reply,
+                    "reply_to": c.get("reply_to", ""),
+                    "like_count": c.get("like_count", 0),
+                    "category": c.get("category", ""),
+                    "sentiment": c.get("sentiment", ""),
+                    "timestamp": c.get("timestamp", ""),
+                })
+
+        most_active = []
+        for item in sorted(active_map.values(), key=lambda x: (x["count"], x["replies_count"], x["total_likes"]), reverse=True):
+            if item["count"] <= 1:
+                continue
+            targets = item.pop("reply_targets")
+            item["reply_targets"] = [
+                {"username": target, "count": count}
+                for target, count in targets.most_common(3)
+                if target
+            ]
+            most_active.append(item)
+            if len(most_active) >= 10:
+                break
 
         def pct(n): return round(n / total * 100, 1) if total > 0 else 0
         avg_conf = round(sum(ml_confs) / len(ml_confs), 3) if ml_confs else 0.0

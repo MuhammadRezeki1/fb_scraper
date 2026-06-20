@@ -13,8 +13,8 @@ export interface ScrapeJob {
   label:          string;
   postResult:     PostResult | null;
   profileResults: ProfileData[];
-  keywordResult:  KeywordResult | null;    // ✅ for monitor/keyword
-  deepPosts:      unknown[];                // ✅ for monitor/deep
+  keywordResult:  KeywordResult | null;
+  deepPosts:      unknown[];
   error:          string | null;
   startedAt:      number;
   finishedAt:     number | null;
@@ -22,8 +22,9 @@ export interface ScrapeJob {
 }
 
 interface ScrapeCtx {
-  job:       ScrapeJob | null;
-  isRunning: boolean;
+  job:                ScrapeJob | null;
+  isRunning:          boolean;
+  pendingAutoFillUrl: string | null;         // ✅ URL auto-fill untuk scrape/posts
   start:     (type: JobType, label: string) => void;
   finish:    (data: {
     postResult?:     PostResult | null;
@@ -34,15 +35,18 @@ interface ScrapeCtx {
   }) => void;
   fail:      (error: string) => void;
   clear:     () => void;
+  setAutoFillUrl: (url: string | null) => void;  // ✅ set URL auto-fill
 }
 
 const ScrapeContext = createContext<ScrapeCtx>({
-  job: null, isRunning: false,
+  job: null, isRunning: false, pendingAutoFillUrl: null,
   start: () => {}, finish: () => {}, fail: () => {}, clear: () => {},
+  setAutoFillUrl: () => {},
 });
 
 export function ScrapeProvider({ children }: { children: ReactNode }) {
   const [job, setJob] = useState<ScrapeJob | null>(null);
+  const [pendingAutoFillUrl, setPendingAutoFillUrl] = useState<string | null>(null);
 
   const start = useCallback((type: JobType, label: string) => {
     setJob({
@@ -86,8 +90,18 @@ export function ScrapeProvider({ children }: { children: ReactNode }) {
 
   const clear = useCallback(() => setJob(null), []);
 
+  const setAutoFillUrl = useCallback((url: string | null) => {
+    setPendingAutoFillUrl(url);
+  }, []);
+
   return (
-    <ScrapeContext.Provider value={{ job, isRunning: job?.status === "running", start, finish, fail, clear }}>
+    <ScrapeContext.Provider value={{
+      job,
+      isRunning: job?.status === "running",
+      pendingAutoFillUrl,
+      start, finish, fail, clear,
+      setAutoFillUrl,
+    }}>
       {children}
     </ScrapeContext.Provider>
   );

@@ -22,16 +22,37 @@ import random
 import threading
 import traceback
 import re
-from datetime import datetime
+import math
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
+from urllib.parse import urlparse, parse_qs
 
 # ── Folder penyimpanan state job ────────────────────────────────────────────
 _HERE      = os.path.dirname(os.path.abspath(__file__))
 _JOBS_DIR  = os.path.join(_HERE, "fb_deep_jobs")
 _POSTS_DIR = os.path.join(_JOBS_DIR, "posts")
+DEFAULT_DETAIL_ENRICH_LIMIT = int(os.getenv("FB_DETAIL_ENRICH_LIMIT", "24"))
+DEFAULT_FAST_MAX_RELATED = int(os.getenv("FB_DEEP_FAST_MAX_RELATED", "2"))
+DEFAULT_FAST_RELATED_LIMIT = int(os.getenv("FB_DEEP_FAST_RELATED_LIMIT", "60"))
+DEFAULT_FAST_ROOT_LIMIT = int(os.getenv("FB_DEEP_FAST_ROOT_LIMIT", "100"))
+DEFAULT_FAST_DETAIL_ENRICH_LIMIT = int(os.getenv("FB_DEEP_FAST_DETAIL_ENRICH_LIMIT", "12"))
+FAST_TYPES = {"posts", "videos"}
 
 os.makedirs(_JOBS_DIR,  exist_ok=True)
 os.makedirs(_POSTS_DIR, exist_ok=True)
+
+
+def _as_bool(value, default=False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _fast_types(types: list) -> list:
+    filtered = [t for t in (types or []) if t in FAST_TYPES]
+    return filtered or ["posts", "videos"]
 
 
 # ── Status konstanta ────────────────────────────────────────────────────────
@@ -163,6 +184,53 @@ def _apply_min_filters_local(items: list, min_likes: Optional[int] = None,
     return filtered
 
 
+def _parse_post_timestamp(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        pass
+
+    low = raw.lower()
+    m = re.search(r'(\d+)\s*(detik|sec|second|menit|mnt|min|minute|jam|hour|hr|hari|day|minggu|mgg|week|bulan|month|tahun|year)', low)
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2)
+    now = datetime.now()
+    if unit in ("detik", "sec", "second"):
+        return now - timedelta(seconds=n)
+    if unit in ("menit", "mnt", "min", "minute"):
+        return now - timedelta(minutes=n)
+    if unit in ("jam", "hour", "hr"):
+        return now - timedelta(hours=n)
+    if unit in ("hari", "day"):
+        return now - timedelta(days=n)
+    if unit in ("minggu", "mgg", "week"):
+        return now - timedelta(weeks=n)
+    if unit in ("bulan", "month"):
+        return now - timedelta(days=n * 30)
+    if unit in ("tahun", "year"):
+        return now - timedelta(days=n * 365)
+    return None
+
+
+def _apply_recent_filter_local(items: list, recent_days: Optional[int]) -> list:
+    if not recent_days or recent_days <= 0:
+        return items
+    cutoff = datetime.now() - timedelta(days=recent_days)
+    kept = []
+    for item in items:
+        ts = _parse_post_timestamp(item.get("timestamp"))
+        if ts is None or ts >= cutoff:
+            kept.append(item)
+    return kept
+
+
 # ── Public API ──────────────────────────────────────────────────────────────
 
 def create_job(mode: str, query: str, config: dict) -> str:
@@ -283,9 +351,14 @@ def _finalize(job_id: str, posts: list, config: Optional[dict] = None):
     min_likes = config.get("min_likes")
     min_comments = config.get("min_comments")
     min_views = config.get("min_views")
+    recent_days = config.get("recent_days", 30)
 
     # Apply min filters
     posts = _apply_min_filters_local(posts, min_likes, min_comments, min_views)
+    before_recent = len(posts)
+    posts = _apply_recent_filter_local(posts, int(recent_days) if recent_days is not None else None)
+    if recent_days and before_recent != len(posts):
+        _log_progress(job_id, f"Filter waktu {recent_days} hari: {before_recent} -> {len(posts)} posts")
     # Apply sorting & assign rank
     posts = _apply_sort_local(posts, sort_by)
 
@@ -327,9 +400,12 @@ def _is_valid_result_url(url: str) -> bool:
     u = url.lower()
     if any(x in u for x in ['/legal/','/privacy/','/help/','/about/','/policies','/security/','/stories/']):
         return False
+    # ✅ FIX: support format share baru FB
+    if re.search(r'/share/(p|v|r)/[a-z0-9_-]+', u):
+        return True
     if 'facebook.com/photo/?fbid=' in u or '/photo/?fbid=' in u:
         return True
-    if '/watch/?v=' in u or '/watch?v=' in u:
+    if '/watch' in u and re.search(r'[?&]v=\d+', u):
         return True
     if re.search(r'/groups/[^/]+/(posts|permalink)/\d+', u):
         return True
@@ -341,17 +417,96 @@ def _is_valid_result_url(url: str) -> bool:
         return True
     return False
 
+def _content_key(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url.replace("https://m.facebook.com", "https://www.facebook.com"))
+        path = parsed.path or ""
+        qs = parse_qs(parsed.query or "")
+        video_id = (qs.get("v") or [""])[0]
+        if not video_id:
+            m = re.search(r"/(?:videos?|watch|reels?|reel)/(\d+)", path)
+            video_id = m.group(1) if m else ""
+        if video_id:
+            return f"video:{video_id}"
+        photo_id = (qs.get("fbid") or [""])[0]
+        if photo_id:
+            return f"photo:{photo_id}"
+        story_id = (qs.get("story_fbid") or [""])[0]
+        if story_id:
+            return f"story:{story_id}"
+    except Exception:
+        pass
+    return (url or "").split("#")[0].rstrip("/")
+
+def _is_canonical_video_permalink(url: str) -> bool:
+    return bool(re.search(r"facebook\.com/[^/?#]+/videos/\d+", url or "", re.I))
+
+def _merge_duplicate_post(existing: dict, incoming: dict):
+    incoming_url = incoming.get("url") or incoming.get("cleanHref") or ""
+    existing_url = existing.get("url") or ""
+    incoming_is_canonical = _is_canonical_video_permalink(incoming_url)
+    existing_is_canonical = _is_canonical_video_permalink(existing_url)
+    existing_views = int(existing.get("views_count", 0) or 0)
+
+    if incoming_is_canonical and not existing_is_canonical:
+        existing["url"] = incoming_url
+        existing["views_count"] = existing_views
+
+    for key in ("caption", "text", "author", "timestamp", "page_name", "group_name"):
+        old = str(existing.get(key) or "").strip()
+        new = str(incoming.get(key) or "").strip()
+        if new and (not old or len(new) > len(old)):
+            existing[key] = incoming.get(key)
+
+    for key in ("likes_count", "comments_count", "shares_count"):
+        if int(incoming.get(key, 0) or 0) > int(existing.get(key, 0) or 0):
+            existing[key] = incoming.get(key, 0)
+
+    if int(incoming.get("views_count", 0) or 0) > int(existing.get("views_count", 0) or 0):
+        existing["views_count"] = incoming.get("views_count", 0)
+
+    existing["engagement_score"] = _engagement_score(existing)
+
+def _split_multi_query(raw: str, strip_hash: bool = False) -> list:
+    """Split comma/newline/semicolon separated query text while preserving single-query behavior."""
+    parts = []
+    seen = set()
+    for part in re.split(r"[,;\n\r]+", raw or ""):
+        q = part.strip()
+        if strip_hash:
+            q = q.lstrip("#").strip()
+        key = q.lower()
+        if q and key not in seen:
+            seen.add(key)
+            parts.append(q)
+    return parts or ([raw.strip().lstrip("#") if strip_hash else raw.strip()] if raw and raw.strip() else [])
+
 
 def _merge_posts(new_posts: list, seen: set, posts: list,
-                 source_label: str, source_key: str = "deep_source") -> int:
+                 source_label: str, source_key: str = "deep_source",
+                 root_label: Optional[str] = None) -> int:
     """Merge new posts into the master list, dedup by url. Returns added count."""
     added = 0
+    root = root_label or source_label
     for p in new_posts:
-        key = p.get("url") or p.get("cleanHref")
-        if not key or key in seen or not _is_valid_result_url(key):
+        raw_url = p.get("url") or p.get("cleanHref")
+        key = _content_key(raw_url)
+        if not raw_url or not _is_valid_result_url(raw_url):
+            continue
+        existing = next((x for x in posts if _content_key(x.get("url") or x.get("cleanHref")) == key), None)
+        if existing:
+            _merge_duplicate_post(existing, p)
+            continue
+        if key in seen:
             continue
         seen.add(key)
         p[source_key] = source_label
+        p["deep_root_query"] = root
+        p["deep_query"] = root
+        if source_key == "deep_source_tag":
+            p["deep_root_tag"] = root
         posts.append(p)
         added += 1
     return added
@@ -360,15 +515,24 @@ def _merge_posts(new_posts: list, seen: set, posts: list,
 # ── _worker_keyword ───────────────────────────────────────────────────────
 def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
     """Deep search keyword — sequential per keyword, flush tiap step."""
+    fast_mode     = _as_bool(config.get("fast_mode"), True)
     max_related   = config.get("max_related", 5)
     types         = config.get("types", ["posts", "videos", "groups", "pages"])
     max_per_query = config.get("max_per_query", 200)
     max_total     = config.get("max_total", 1000)
     sort_by       = config.get("sort_by", "engagement")
 
+    if fast_mode:
+        types = _fast_types(types)
+        max_related = min(max_related, DEFAULT_FAST_MAX_RELATED)
+        max_per_query = min(max_per_query, DEFAULT_FAST_ROOT_LIMIT)
+
+    # Keep each keyword root bounded by max_per_query so multi-query jobs stay predictable.
+    effective_per_query = min(max_total, max(25, max_per_query))
+
     # v4: comment scraping params
     max_comments_per_post = config.get("max_comments_per_post", 0)
-    top_comments_count = config.get("top_comments_count", 5)
+    top_comments_count = config.get("top_comments_count", 10)
 
     # Pass sort/filter/comment params ke monitor.scrape_keyword()
     kwargs = {
@@ -380,6 +544,64 @@ def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
         "max_comments_per_post": 0,
         "top_comments_count": top_comments_count,
     }
+    detail_limit = int(config.get("detail_enrich_limit", DEFAULT_DETAIL_ENRICH_LIMIT))
+    if fast_mode:
+        detail_limit = min(detail_limit, DEFAULT_FAST_DETAIL_ENRICH_LIMIT)
+    root_kwargs = {**kwargs, "detail_enrich_limit": detail_limit}
+    fast_kwargs = {**kwargs, "detail_enrich_limit": 0}
+    related_limit = DEFAULT_FAST_RELATED_LIMIT if fast_mode else 80
+
+    root_keywords = _split_multi_query(keyword)
+    if len(root_keywords) > 1:
+        seen: set = set()
+        posts: list = []
+        _log_progress(job_id, f"Multi keyword: {len(root_keywords)} query ({', '.join(root_keywords)})")
+        if fast_mode:
+            _log_progress(job_id, f"  Fast mode aktif: types={types}, max_related={max_related}, detail_limit={detail_limit}")
+        if max_comments_per_post > 0:
+            _log_progress(job_id, f"  (comment scraping enabled: {max_comments_per_post}/post, top {top_comments_count})")
+
+        for qi, root_kw in enumerate(root_keywords, 1):
+            if _is_cancelled(job_id) or len(posts) >= max_total:
+                break
+            remaining = max_total - len(posts)
+            root_limit = max(1, min(effective_per_query, remaining))
+            _log_progress(job_id, f"Query {qi}/{len(root_keywords)}: scraping '{root_kw}' (limit={root_limit}, types={types})...")
+            try:
+                result = monitor.scrape_keyword(root_kw, max_results=root_limit, types=types, **root_kwargs)
+                added = _merge_posts(result.get("results", []), seen, posts, root_kw, "deep_source", root_kw)
+                _log_progress(job_id, f"  '{root_kw}': +{added} posts (combined total: {len(posts)})")
+            except Exception as e:
+                _log_progress(job_id, f"  \u26a0\ufe0f '{root_kw}' gagal: {e}")
+
+            related_keywords = _generate_related_keywords(root_kw, max_related)
+            _log_progress(job_id, f"  Expand '{root_kw}' ke {len(related_keywords)} related keywords...")
+            for i, rk in enumerate(related_keywords, 1):
+                if _is_cancelled(job_id) or len(posts) >= max_total:
+                    break
+                if not fast_mode:
+                    time.sleep(random.uniform(0.3, 1.0))
+                _log_progress(job_id, f"    [{i}/{len(related_keywords)}] '{rk}'...")
+                try:
+                    r2 = monitor.scrape_keyword(rk, max_results=min(related_limit, max_total - len(posts)), types=["posts", "videos"], **fast_kwargs)
+                    added2 = _merge_posts(r2.get("results", []), seen, posts, rk, "deep_source", root_kw)
+                    _log_progress(job_id, f"      +{added2} posts (combined total: {len(posts)})")
+                except Exception as e:
+                    _log_progress(job_id, f"      \u26a0\ufe0f '{rk}' gagal: {e}")
+
+            _update_state(job_id, total_fetched=len(posts))
+            _write_posts(job_id, posts)
+            _log_progress(job_id, f"  Flush after '{root_kw}': {len(posts)} posts saved to disk")
+
+        if max_comments_per_post > 0 and posts:
+            _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
+            monitor.enrich_comments(
+                posts, max_comments_per_post, top_comments_count,
+                lambda msg: _log_progress(job_id, msg),
+            )
+            _write_posts(job_id, posts)
+        _finalize(job_id, posts, config)
+        return
 
     seen:  set  = set()
     posts: list = []
@@ -388,13 +610,15 @@ def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
     if _is_cancelled(job_id):
         return
     _log_progress(job_id, f"Step 1: scraping '{keyword}' (types={types})...")
+    if fast_mode:
+        _log_progress(job_id, f"  Fast mode aktif: max_related={max_related}, detail_limit={detail_limit}")
     if max_comments_per_post > 0:
         _log_progress(job_id, f"  (comment scraping enabled: {max_comments_per_post}/post, top {top_comments_count})")
 
     try:
-        result = monitor.scrape_keyword(keyword, max_results=max_per_query,
-                                         types=types, **kwargs)
-        added = _merge_posts(result.get("results", []), seen, posts, keyword)
+        result = monitor.scrape_keyword(keyword, max_results=effective_per_query,
+                                         types=types, **root_kwargs)
+        added = _merge_posts(result.get("results", []), seen, posts, keyword, "deep_source", keyword)
         _log_progress(job_id, f"  '{keyword}': +{added} posts (total: {len(posts)})")
     except Exception as e:
         _log_progress(job_id, f"  \u26a0\ufe0f '{keyword}' gagal: {e}")
@@ -413,11 +637,12 @@ def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
         if len(posts) >= max_total:
             break
 
-        time.sleep(random.uniform(0.3, 1.0))
+        if not fast_mode:
+            time.sleep(random.uniform(0.3, 1.0))
         _log_progress(job_id, f"  [{i}/{len(related_keywords)}] '{rk}'...")
         try:
-            r2 = monitor.scrape_keyword(rk, max_results=100, types=["posts"], **kwargs)
-            added2 = _merge_posts(r2.get("results", []), seen, posts, rk)
+            r2 = monitor.scrape_keyword(rk, max_results=related_limit, types=["posts", "videos"], **fast_kwargs)
+            added2 = _merge_posts(r2.get("results", []), seen, posts, rk, "deep_source", keyword)
             _log_progress(job_id, f"    +{added2} posts (total: {len(posts)})")
         except Exception as e:
             _log_progress(job_id, f"    \u26a0\ufe0f '{rk}' gagal: {e}")
@@ -439,14 +664,22 @@ def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
 # ── _worker_hashtag ───────────────────────────────────────────────────────
 def _worker_hashtag(job_id: str, tag: str, config: dict, monitor):
     """Deep search hashtag — sequential seperti keyword worker."""
+    fast_mode     = _as_bool(config.get("fast_mode"), True)
     max_related   = config.get("max_related_hashtags", 10)
     max_per_query = config.get("max_per_query", 300)
     max_total     = config.get("max_total", 1000)
     sort_by       = config.get("sort_by", "engagement")
 
+    if fast_mode:
+        max_related = min(max_related, DEFAULT_FAST_MAX_RELATED)
+        max_per_query = min(max_per_query, DEFAULT_FAST_ROOT_LIMIT)
+
+    # Keep each hashtag root bounded by max_per_query so multi-tag jobs stay predictable.
+    effective_per_query = min(max_total, max(25, max_per_query))
+
     # v4: comment scraping params
     max_comments_per_post = config.get("max_comments_per_post", 0)
-    top_comments_count = config.get("top_comments_count", 5)
+    top_comments_count = config.get("top_comments_count", 10)
 
     kwargs = {
         "sort_by": sort_by,
@@ -456,6 +689,66 @@ def _worker_hashtag(job_id: str, tag: str, config: dict, monitor):
         "max_comments_per_post": 0,
         "top_comments_count": top_comments_count,
     }
+    detail_limit = int(config.get("detail_enrich_limit", DEFAULT_DETAIL_ENRICH_LIMIT))
+    if fast_mode:
+        detail_limit = min(detail_limit, DEFAULT_FAST_DETAIL_ENRICH_LIMIT)
+    root_kwargs = {**kwargs, "detail_enrich_limit": detail_limit}
+    fast_kwargs = {**kwargs, "detail_enrich_limit": 0}
+    related_limit = DEFAULT_FAST_RELATED_LIMIT if fast_mode else 100
+
+    root_tags = _split_multi_query(tag, strip_hash=True)
+    if len(root_tags) > 1:
+        seen: set = set()
+        posts: list = []
+        _log_progress(job_id, f"Multi hashtag: {len(root_tags)} tag ({', '.join('#' + t for t in root_tags)})")
+        if fast_mode:
+            _log_progress(job_id, f"  Fast mode aktif: max_related={max_related}, detail_limit={detail_limit}")
+        if max_comments_per_post > 0:
+            _log_progress(job_id, f"  (comment scraping enabled: {max_comments_per_post}/post)")
+
+        for qi, root_tag in enumerate(root_tags, 1):
+            if _is_cancelled(job_id) or len(posts) >= max_total:
+                break
+            remaining = max_total - len(posts)
+            root_limit = max(1, min(effective_per_query, remaining))
+            _log_progress(job_id, f"Query {qi}/{len(root_tags)}: scraping '#{root_tag}' (limit={root_limit})...")
+            try:
+                result = monitor.scrape_hashtag(root_tag, max_results=root_limit, **root_kwargs)
+                added = _merge_posts(result.get("results", []), seen, posts, root_tag, "deep_source_tag", root_tag)
+                _log_progress(job_id, f"  '#{root_tag}': +{added} posts (combined total: {len(posts)})")
+            except Exception as e:
+                _log_progress(job_id, f"  \u26a0\ufe0f '#{root_tag}' gagal: {e}")
+
+            related = _generate_related_hashtags(root_tag, max_related, posts)
+            _log_progress(job_id, f"  Expand '#{root_tag}' ke {len(related)} related keywords...")
+            for i, rk in enumerate(related, 1):
+                if _is_cancelled(job_id) or len(posts) >= max_total:
+                    break
+                if not fast_mode:
+                    time.sleep(random.uniform(0.3, 1.0))
+                _log_progress(job_id, f"    [{i}/{len(related)}] '{rk}'...")
+                try:
+                    r2 = monitor.scrape_keyword(rk, max_results=min(related_limit, max_total - len(posts)), types=["posts", "videos"], **fast_kwargs)
+                    from fb_keyword_monitor import _hashtag_in_item
+                    relevant = [p for p in r2.get("results", []) if _hashtag_in_item(p, root_tag)]
+                    added2 = _merge_posts(relevant, seen, posts, rk, "deep_source_tag", root_tag)
+                    _log_progress(job_id, f"      +{added2} posts (combined total: {len(posts)})")
+                except Exception as e:
+                    _log_progress(job_id, f"      \u26a0\ufe0f '{rk}' gagal: {e}")
+
+            _update_state(job_id, total_fetched=len(posts))
+            _write_posts(job_id, posts)
+            _log_progress(job_id, f"  Flush after '#{root_tag}': {len(posts)} posts saved to disk")
+
+        if max_comments_per_post > 0 and posts:
+            _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
+            monitor.enrich_comments(
+                posts, max_comments_per_post, top_comments_count,
+                lambda msg: _log_progress(job_id, msg),
+            )
+            _write_posts(job_id, posts)
+        _finalize(job_id, posts, config)
+        return
 
     seen:  set  = set()
     posts: list = []
@@ -465,13 +758,15 @@ def _worker_hashtag(job_id: str, tag: str, config: dict, monitor):
 
     # ── Step 1: panggil monitor.scrape_hashtag() yang sudah pake real URL + fallback
     _log_progress(job_id, f"Step 1: scraping '#{tag}' (hashtag URL + fallback)...")
+    if fast_mode:
+        _log_progress(job_id, f"  Fast mode aktif: max_related={max_related}, detail_limit={detail_limit}")
     if max_comments_per_post > 0:
         _log_progress(job_id, f"  (comment scraping enabled: {max_comments_per_post}/post)")
 
     try:
-        result = monitor.scrape_hashtag(tag, max_results=max_per_query, **kwargs)
+        result = monitor.scrape_hashtag(tag, max_results=effective_per_query, **root_kwargs)
         # result['results'] sudah ter-sort dan ter-filter oleh monitor
-        added = _merge_posts(result.get("results", []), seen, posts, tag, "deep_source_tag")
+        added = _merge_posts(result.get("results", []), seen, posts, tag, "deep_source_tag", tag)
         _log_progress(job_id, f"  '#{tag}': +{added} posts (total: {len(posts)})")
     except Exception as e:
         _log_progress(job_id, f"  \u26a0\ufe0f '#{tag}' gagal: {e}")
@@ -490,13 +785,14 @@ def _worker_hashtag(job_id: str, tag: str, config: dict, monitor):
         if len(posts) >= max_total:
             break
 
-        time.sleep(random.uniform(0.3, 1.0))
+        if not fast_mode:
+            time.sleep(random.uniform(0.3, 1.0))
         _log_progress(job_id, f"  [{i}/{len(related)}] '{rk}'...")
         try:
-            r2 = monitor.scrape_keyword(rk, max_results=150, types=["posts", "videos"], **kwargs)
+            r2 = monitor.scrape_keyword(rk, max_results=related_limit, types=["posts", "videos"], **fast_kwargs)
             from fb_keyword_monitor import _hashtag_in_item
             relevant = [p for p in r2.get("results", []) if _hashtag_in_item(p, tag)]
-            added2 = _merge_posts(relevant, seen, posts, rk, "deep_source_tag")
+            added2 = _merge_posts(relevant, seen, posts, rk, "deep_source_tag", tag)
             _log_progress(job_id, f"    +{added2} posts (total: {len(posts)})")
         except Exception as e:
             _log_progress(job_id, f"    \u26a0\ufe0f '{rk}' gagal: {e}")
@@ -518,13 +814,16 @@ def _worker_hashtag(job_id: str, tag: str, config: dict, monitor):
 # ── _worker_trending ──────────────────────────────────────────────────────
 def _worker_trending(job_id: str, query: str, config: dict, monitor):
     """Deep search trending — sequential per keyword."""
+    fast_mode = _as_bool(config.get("fast_mode"), True)
     types     = config.get("types", ["posts", "videos", "groups", "pages"])
     max_total = config.get("max_total", 1000)
     sort_by   = config.get("sort_by", "engagement")
+    if fast_mode:
+        types = _fast_types(types)
 
     # v4: comment scraping params
     max_comments_per_post = config.get("max_comments_per_post", 0)
-    top_comments_count = config.get("top_comments_count", 5)
+    top_comments_count = config.get("top_comments_count", 10)
 
     kwargs = {
         "sort_by": sort_by,
@@ -534,12 +833,16 @@ def _worker_trending(job_id: str, query: str, config: dict, monitor):
         "max_comments_per_post": 0,
         "top_comments_count": top_comments_count,
     }
+    detail_limit = int(config.get("detail_enrich_limit", DEFAULT_DETAIL_ENRICH_LIMIT))
+    if fast_mode:
+        detail_limit = min(detail_limit, DEFAULT_FAST_DETAIL_ENRICH_LIMIT)
+    root_kwargs = {**kwargs, "detail_enrich_limit": detail_limit}
 
     seen:  set  = set()
     posts: list = []
 
     if query:
-        search_keywords = [query]
+        search_keywords = _split_multi_query(query)
     else:
         search_keywords = [
             "viral hari ini",
@@ -549,6 +852,8 @@ def _worker_trending(job_id: str, query: str, config: dict, monitor):
         ]
 
     _log_progress(job_id, f"Scraping {len(search_keywords)} keywords (sequential)...")
+    if fast_mode:
+        _log_progress(job_id, f"  Fast mode aktif: types={types}, detail_limit={detail_limit}")
 
     for i, kw in enumerate(search_keywords, 1):
         if _is_cancelled(job_id):
@@ -556,22 +861,29 @@ def _worker_trending(job_id: str, query: str, config: dict, monitor):
         if len(posts) >= max_total:
             break
 
-        _log_progress(job_id, f"[{i}/{len(search_keywords)}] Trending: '{kw}'...")
+        remaining_keywords = max(1, len(search_keywords) - i + 1)
+        per_keyword_limit = max(25, min(200, math.ceil((max_total - len(posts)) / remaining_keywords)))
+        if fast_mode:
+            per_keyword_limit = min(per_keyword_limit, DEFAULT_FAST_ROOT_LIMIT)
+        _log_progress(job_id, f"[{i}/{len(search_keywords)}] Trending: '{kw}' (limit={per_keyword_limit})...")
         try:
             # monitor.scrape_trending() sudah handle engagement filter internal
             result = monitor.scrape_trending(
-                max_results=200,
+                max_results=per_keyword_limit,
                 keyword=kw,
                 types=types,
-                **kwargs
+                **root_kwargs
             )
             added = 0
             for p in result.get("results", []):
-                key = p.get("url") or p.get("cleanHref")
-                if not key or key in seen or not _is_valid_result_url(key):
+                raw_url = p.get("url") or p.get("cleanHref")
+                key = _content_key(raw_url)
+                if not raw_url or key in seen or not _is_valid_result_url(raw_url):
                     continue
                 seen.add(key)
                 p["deep_source"] = kw
+                p["deep_root_query"] = kw
+                p["deep_query"] = kw
                 posts.append(p)
                 added += 1
             _log_progress(job_id, f"  +{added} posts (total: {len(posts)})")

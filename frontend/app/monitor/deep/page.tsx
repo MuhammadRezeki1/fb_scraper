@@ -1,5 +1,6 @@
 "use client";
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useRouter } from "next/navigation";
 import { api, DeepJobState, DeepPost } from "@/lib/api";
 import {
   Search, Loader2, ExternalLink, FileText, Users, Video,
@@ -11,6 +12,7 @@ import GlassCard from "@/components/ui/GlassCard";
 import DownloadButton from "@/components/ui/DownloadButton";
 import { useScrape } from "@/contexts/ScrapeContext";
 import { usePersistState } from "@/hooks/usePersistState";
+import { downloadJSON, downloadCSV } from "@/lib/download";
 
 type DeepMode = "keyword" | "hashtag" | "trending";
 
@@ -93,6 +95,17 @@ function primaryText(post: DeepPost) {
   return (post.group_about || post.caption || post.text || "").trim();
 }
 
+function sourceLabel(post: DeepPost): string {
+  return (
+    post.deep_root_query ||
+    post.deep_root_tag ||
+    post.deep_query ||
+    post.deep_source_tag ||
+    post.deep_source ||
+    "Tanpa sumber"
+  ).trim();
+}
+
 function errorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
 }
@@ -106,6 +119,7 @@ function fmtNum(n?: number): string {
 
 // ─── CommentSection ──────────────────────────────────────────────────────────
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function CommentSection({ post }: { post: DeepPost }) {
   const [expanded, setExpanded] = useState(false);
 
@@ -128,9 +142,9 @@ function CommentSection({ post }: { post: DeepPost }) {
       {/* Header */}
       <div className="flex items-center gap-1.5 text-xs font-semibold" style={{ color: "#4a5070" }}>
         <MessageCircle size={13} style={{ color: "#3b6dce" }} />
-        Top Komentar
+        Top Komentar (Like Terbanyak)
         <span style={{ color: "#8890aa", fontWeight: 400 }}>
-          ({post.top_comments.length}{otherCount > 0 ? ` dari ${total}` : ""})
+          ({post.top_comments.length} komentar{otherCount > 0 ? ` · ${total} total scraped` : ""})
         </span>
       </div>
 
@@ -144,8 +158,7 @@ function CommentSection({ post }: { post: DeepPost }) {
           {/* Author + timestamp */}
           <div className="flex items-center gap-2">
             {/* Avatar placeholder */}
-            <div
-              className="flex-shrink-0 rounded-full flex items-center justify-center text-white font-bold"
+          <div className="shrink-0 rounded-full flex items-center justify-center text-white font-bold"
               style={{ width: 24, height: 24, fontSize: 10, background: `hsl(${(c.comment_author?.charCodeAt(0) || 0) * 47 % 360}, 60%, 50%)` }}
             >
               {(c.comment_author || "?")[0].toUpperCase()}
@@ -190,7 +203,7 @@ function CommentSection({ post }: { post: DeepPost }) {
             >
               <div className="flex items-center gap-2">
                 <div
-                  className="flex-shrink-0 rounded-full flex items-center justify-center text-white font-bold"
+                  className="shrink-0 rounded-full flex items-center justify-center text-white font-bold"
                   style={{ width: 20, height: 20, fontSize: 9, background: `hsl(${(c.comment_author?.charCodeAt(0) || 0) * 47 % 360}, 55%, 55%)` }}
                 >
                   {(c.comment_author || "?")[0].toUpperCase()}
@@ -215,7 +228,7 @@ function CommentSection({ post }: { post: DeepPost }) {
 
 // ─── PostCard ────────────────────────────────────────────────────────────────
 
-function PostCard({ post, idx }: { post: DeepPost; idx: number }) {
+function PostCard({ post, idx, onScrapePost }: { post: DeepPost; idx: number; onScrapePost: (url: string) => void }) {
   const text       = primaryText(post);
   const domain     = mediaDomain(post.url);
   const realPost   = isRealPost(post);
@@ -254,7 +267,12 @@ function PostCard({ post, idx }: { post: DeepPost; idx: number }) {
             )}
 
             {/* Source tag */}
-            {post.deep_source_tag && (
+            {sourceLabel(post) !== "Tanpa sumber" && (
+              <span className="text-xs px-2 py-0.5 rounded-full" style={{ background: "rgba(29,122,71,0.08)", color: "#1d7a47" }}>
+                {sourceLabel(post)}
+              </span>
+            )}
+            {post.deep_source_tag && post.deep_source_tag !== sourceLabel(post) && (
               <span className="text-xs px-2 py-0.5 rounded-full" style={{ background: "rgba(107,94,199,0.08)", color: "#6b5ec7" }}>
                 #{post.deep_source_tag}
               </span>
@@ -285,7 +303,7 @@ function PostCard({ post, idx }: { post: DeepPost; idx: number }) {
 
           {/* Row 3: Caption/text */}
           {hasContent_ ? (
-            <p className="text-sm leading-6 whitespace-pre-wrap break-words" style={{ color: "#1a1c23" }}>
+            <p className="text-sm leading-6 whitespace-pre-wrap overflow-wrap-anywhere" style={{ color: "#1a1c23" }}>
               {text}
             </p>
           ) : (
@@ -295,16 +313,16 @@ function PostCard({ post, idx }: { post: DeepPost; idx: number }) {
           )}
 
           {/* Row 4: Engagement metrics */}
-          {hasEngage ? (
+          {(realPost || hasContent_ || hasEngage) ? (
             <div className="flex flex-wrap items-center gap-3">
-              {(post.likes_count || 0) > 0 && (
+              {(post.likes_count || 0) >= 0 && (
                 <span className="flex items-center gap-1.5 text-xs font-medium" style={{ color: "#4a5070" }}>
                   {/* ✅ FIX: Heart icon dari lucide, bukan \u2764 string */}
                   <Heart size={14} style={{ color: "#e0245e" }} fill="#e0245e" />
                   {fmtNum(post.likes_count)}
                 </span>
               )}
-              {(post.comments_count || 0) > 0 && (
+              {(post.comments_count || 0) >= 0 && (
                 <span className="flex items-center gap-1.5 text-xs font-medium" style={{ color: "#4a5070" }}>
                   <MessageCircle size={14} style={{ color: "#3b6dce" }} />
                   {fmtNum(post.comments_count)}
@@ -317,7 +335,7 @@ function PostCard({ post, idx }: { post: DeepPost; idx: number }) {
                 </span>
               )}
               {/* ✅ FIX: Shares menggunakan Share2 icon */}
-              {(post.shares_count || 0) > 0 && (
+              {(post.shares_count || 0) >= 0 && (
                 <span className="flex items-center gap-1.5 text-xs font-medium" style={{ color: "#4a5070" }}>
                   <Share2 size={14} style={{ color: "#1d7a47" }} />
                   {fmtNum(post.shares_count)}
@@ -339,12 +357,10 @@ function PostCard({ post, idx }: { post: DeepPost; idx: number }) {
             {compactUrl(post.url)}
           </div>
 
-          {/* Row 6: Comments */}
-          <CommentSection post={post} />
         </div>
 
         {/* ── Right: Actions ── */}
-        <div className="flex shrink-0 flex-row gap-2 lg:w-36 lg:flex-col">
+        <div className="flex shrink-0 flex-row gap-1.5 lg:w-32 lg:flex-col">
           <a
             href={post.url}
             target="_blank"
@@ -352,8 +368,16 @@ function PostCard({ post, idx }: { post: DeepPost; idx: number }) {
             className="flex-1 lg:flex-none flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium transition-all hover:bg-purple-50"
             style={{ color: "#6b5ec7", border: "1px solid rgba(107,94,199,0.2)", background: "rgba(107,94,199,0.05)" }}
           >
-            <ExternalLink size={13} /> Buka FB
+            <ExternalLink size={12} /> Buka FB
           </a>
+          <button
+            onClick={() => onScrapePost(post.url)}
+            title="Scrape detail postingan ini"
+            className="flex-1 lg:flex-none flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium transition-all hover:bg-green-50"
+            style={{ color: "#1d7a47", border: "1px solid rgba(29,122,71,0.2)", background: "rgba(29,122,71,0.05)" }}
+          >
+            <FileText size={12} /> Scrape Post
+          </button>
           <DownloadButton
             data={post}
             filename={`fb-post-${post.author || "unknown"}-${idx}`}
@@ -369,14 +393,16 @@ function PostCard({ post, idx }: { post: DeepPost; idx: number }) {
 // ─── Main Page ───────────────────────────────────────────────────────────────
 
 export default function DeepSearchPage() {
-  const { job, isRunning, start, finish, fail } = useScrape();
+  const router = useRouter();
+  const { job, isRunning, start, finish, fail, setAutoFillUrl } = useScrape();
 
   const [mode,    setMode]    = usePersistState<DeepMode>("deep-mode",  "keyword");
   const [query,   setQuery]   = usePersistState("deep-query",           "");
-  const [types,   setTypes]   = usePersistState<string[]>("deep-types", ["posts", "videos", "groups", "pages"]);
+  const [types,   setTypes]   = usePersistState<string[]>("deep-types", ["posts", "videos"]);
   const [sortBy,  setSortBy]  = usePersistState<"engagement" | "recent">("deep-sort", "engagement");
   const [maxTotal,            setMaxTotal]            = useState(1000);
-  const [maxCommentsPerPost,  setMaxCommentsPerPost]  = useState(0);
+  const [recentDays,          setRecentDays]          = useState(30);
+  const [fastMode,            setFastMode]            = useState(true);
 
   const [jobId,     setJobId]     = useState<string | null>(null);
   const [jobState,  setJobState]  = useState<DeepJobState | null>(null);
@@ -384,6 +410,7 @@ export default function DeepSearchPage() {
   const [loading,   setLoading]   = useState(false);
   const [error,     setError]     = useState("");
   const [activeTab, setActiveTab] = useState("all");
+  const [activeSource, setActiveSource] = useState("all");
   const [showEmpty, setShowEmpty] = useState(false);
 
   const [cachedPosts, setCachedPosts] = usePersistState<DeepPost[]>("deep-posts-v2", []);
@@ -402,7 +429,24 @@ export default function DeepSearchPage() {
   // Split: post "nyata" vs post data terbatas
   const realPosts  = useMemo(() => allPosts.filter(p => isRealPost(p) && (hasContent(p) || hasEngagement(p))), [allPosts]);
   const limitedPosts = useMemo(() => allPosts.filter(p => !isRealPost(p) || (!hasContent(p) && !hasEngagement(p))), [allPosts]);
-  const displayPosts = showEmpty ? allPosts : (realPosts.length > 0 ? realPosts : allPosts);
+  const baseDisplayPosts = showEmpty ? allPosts : (realPosts.length > 0 ? realPosts : allPosts);
+  const sourceOptions = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const post of baseDisplayPosts) {
+      const label = sourceLabel(post);
+      counts.set(label, (counts.get(label) || 0) + 1);
+    }
+    return Array.from(counts.entries())
+      .map(([label, count]) => ({ label, count }))
+      .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+  }, [baseDisplayPosts]);
+  const effectiveSource = activeSource === "all" || sourceOptions.some(opt => opt.label === activeSource)
+    ? activeSource
+    : "all";
+  const displayPosts = useMemo(
+    () => effectiveSource === "all" ? baseDisplayPosts : baseDisplayPosts.filter(post => sourceLabel(post) === effectiveSource),
+    [effectiveSource, baseDisplayPosts],
+  );
 
   const groups = useMemo(() => groupByType(displayPosts), [displayPosts]);
 
@@ -469,7 +513,7 @@ export default function DeepSearchPage() {
     };
 
     poll();
-    pollRef.current = setInterval(poll, 3000);
+    pollRef.current = setInterval(poll, 5000);
     return () => { stopPolling(); };
   }, [jobId, finish, fail, setCachedPosts, stopPolling]);
 
@@ -477,18 +521,39 @@ export default function DeepSearchPage() {
     if (!query.trim() && mode !== "trending") { setError("Query wajib diisi"); return; }
     if (isRunning) { setError("Scraping lain sedang berjalan"); return; }
     setLoading(true); setError(""); setJobId(null); setJobState(null);
-    setPosts([]); setCachedPosts([]); setActiveTab("all"); setShowEmpty(false);
+    setPosts([]); setCachedPosts([]); setActiveTab("all"); setActiveSource("all"); setShowEmpty(false);
     cancelledRef.current = false;
     const label = query || `${mode} search`;
     start("deep", label);
     try {
       let res;
+      const selectedTypes = types.length ? types : ["posts", "videos"];
+      const runTypes = fastMode
+        ? (selectedTypes.filter(t => t === "posts" || t === "videos").length
+            ? selectedTypes.filter(t => t === "posts" || t === "videos")
+            : ["posts", "videos"])
+        : selectedTypes;
+      const commonConfig = { max_total: maxTotal, recent_days: recentDays, fast_mode: fastMode };
       if (mode === "keyword") {
-        res = await api.deep.keyword(query, { max_related: 5, max_per_query: 200, max_total: maxTotal, types, max_comments_per_post: maxCommentsPerPost });
+        res = await api.deep.keyword(query, {
+          ...commonConfig,
+          max_related: fastMode ? 2 : 5,
+          max_per_query: fastMode ? 100 : 200,
+          types: runTypes,
+        });
       } else if (mode === "hashtag") {
-        res = await api.deep.hashtag(query, { max_related_hashtags: 10, max_per_query: 300, max_total: maxTotal, max_comments_per_post: maxCommentsPerPost });
+        res = await api.deep.hashtag(query, {
+          ...commonConfig,
+          max_related_hashtags: fastMode ? 2 : 10,
+          max_per_query: fastMode ? 100 : 300,
+        });
       } else {
-        res = await api.deep.trending({ keyword: query, sort_by: sortBy, types, max_total: maxTotal, max_comments_per_post: maxCommentsPerPost });
+        res = await api.deep.trending({
+          ...commonConfig,
+          keyword: query,
+          sort_by: sortBy,
+          types: runTypes,
+        });
       }
       if (res.data?.job_id) setJobId(res.data.job_id);
       else throw new Error("Job ID tidak diterima");
@@ -514,9 +579,14 @@ export default function DeepSearchPage() {
 
   const handleReset = () => {
     stopPolling(); setJobId(null); setJobState(null); setPosts([]);
-    setCachedPosts([]); setError(""); setLoading(false); setShowEmpty(false);
+    setCachedPosts([]); setError(""); setLoading(false); setShowEmpty(false); setActiveSource("all");
     cancelledRef.current = false; activeJobIdRef.current = null;
   };
+
+  const handleScrapePost = useCallback((url: string) => {
+    setAutoFillUrl(url);
+    router.push("/scrape/posts");
+  }, [setAutoFillUrl, router]);
 
   const statusIcon = () => {
     if (!jobState) return null;
@@ -531,8 +601,6 @@ export default function DeepSearchPage() {
   };
 
   const tabKeys = ["all", ...Object.keys(groups).filter(k => groups[k as keyof typeof groups].length > 0)];
-  const showCommentWarning = isMyRun && maxCommentsPerPost > 0 && maxTotal > 50;
-
   return (
     <div className="p-6 max-w-7xl mx-auto space-y-6">
 
@@ -578,21 +646,27 @@ export default function DeepSearchPage() {
         {mode !== "trending" && (
           <div>
             <label className="text-sm font-medium mb-1 block" style={{ color: "#4a5070" }}>
-              {mode === "keyword" ? "Keyword" : "Hashtag (tanpa #)"}
+              {mode === "keyword" ? "Keyword / Dork" : "Hashtag (boleh banyak, pisahkan koma)"}
             </label>
             <input
               type="text" value={query} onChange={e => setQuery(e.target.value)}
-              placeholder={mode === "keyword" ? 'Contoh: "jokowi"' : 'Contoh: "pertamina"'}
+              placeholder={mode === "keyword" ? 'Contoh: bemui, bemugm, demo' : 'Contoh: bemui, bemugm, demo'}
               className="glass-input w-full px-4 py-3 text-sm" disabled={isMyRun}
             />
+            <p className="text-xs mt-1" style={{ color: "#8890aa" }}>
+              Pisahkan dengan koma untuk scrape masing-masing query dan melihat hasil gabungan.
+            </p>
           </div>
         )}
 
         {mode === "trending" && (
           <>
             <div>
-              <label className="text-sm font-medium mb-1 block" style={{ color: "#4a5070" }}>Keyword (Opsional)</label>
-              <input type="text" value={query} onChange={e => setQuery(e.target.value)} placeholder="Kosongkan untuk scrape semua trending" className="glass-input w-full px-4 py-3 text-sm" disabled={isMyRun} />
+              <label className="text-sm font-medium mb-1 block" style={{ color: "#4a5070" }}>Keyword Trending (Opsional, boleh banyak)</label>
+              <input type="text" value={query} onChange={e => setQuery(e.target.value)} placeholder="Contoh: bemui, bemugm, demo atau kosongkan untuk trending umum" className="glass-input w-full px-4 py-3 text-sm" disabled={isMyRun} />
+              <p className="text-xs mt-1" style={{ color: "#8890aa" }}>
+                Pisahkan dengan koma untuk memproses beberapa trending keyword.
+              </p>
             </div>
             <div>
               <label className="text-sm font-medium mb-2 block" style={{ color: "#4a5070" }}>Sort By</label>
@@ -631,24 +705,36 @@ export default function DeepSearchPage() {
           </div>
         )}
 
+        <label
+          className="flex items-start gap-3 rounded-xl px-4 py-3 text-sm"
+          style={{ background: "rgba(107,94,199,0.06)", border: "1px solid rgba(107,94,199,0.14)", color: "#4a5070" }}
+        >
+          <input
+            type="checkbox"
+            checked={fastMode}
+            onChange={e => setFastMode(e.target.checked)}
+            disabled={isMyRun}
+            className="mt-1"
+          />
+          <span>
+            <span className="font-semibold" style={{ color: "#1a1c23" }}>Mode cepat</span>
+            <span className="block text-xs mt-0.5" style={{ color: "#8890aa" }}>
+              Fokus Post + Video/Reels, related keyword dibatasi, dan enrichment detail secukupnya agar CPU lebih ringan.
+            </span>
+          </span>
+        </label>
+
         <div className="flex gap-4 flex-wrap">
           <div>
             <label className="text-sm font-medium mb-1 block" style={{ color: "#4a5070" }}>Max Total Posts</label>
             <input type="number" value={maxTotal} onChange={e => setMaxTotal(Math.min(5000, Math.max(100, parseInt(e.target.value) || 100)))} disabled={isMyRun} className="glass-input w-28 px-4 py-2 text-sm" />
           </div>
           <div>
-            <label className="text-sm font-medium mb-1 block" style={{ color: "#4a5070" }}>Komentar per Post</label>
-            <input type="number" value={maxCommentsPerPost} onChange={e => setMaxCommentsPerPost(Math.min(50, Math.max(0, parseInt(e.target.value) || 0)))} disabled={isMyRun} className="glass-input w-28 px-4 py-2 text-sm" />
-            <p className="text-xs mt-1" style={{ color: "#8890aa" }}>0 = skip (lebih cepat)</p>
+            <label className="text-sm font-medium mb-1 block" style={{ color: "#4a5070" }}>Rentang Hari</label>
+            <input type="number" value={recentDays} onChange={e => setRecentDays(Math.min(365, Math.max(0, parseInt(e.target.value) || 0)))} disabled={isMyRun} className="glass-input w-28 px-4 py-2 text-sm" />
+            <p className="text-xs mt-1" style={{ color: "#8890aa" }}>30 = sebulan terakhir, 0 = semua</p>
           </div>
         </div>
-
-        {showCommentWarning && (
-          <div className="p-3 rounded-xl text-xs flex items-center gap-2" style={{ background: "rgba(192,57,79,0.06)", border: "1px solid rgba(192,57,79,0.15)", color: "#c0394f" }}>
-            <AlertTriangle size={13} className="shrink-0" />
-            Scraping komentar akan menambah waktu signifikan per post
-          </div>
-        )}
 
         {/* Buttons */}
         <div className="flex gap-2">
@@ -735,6 +821,44 @@ export default function DeepSearchPage() {
             </div>
           )}
 
+          {/* Source filter */}
+          {sourceOptions.length > 1 && (
+            <div className="glass rounded-2xl p-2 flex gap-1 flex-wrap">
+              <button
+                onClick={() => { setActiveSource("all"); setActiveTab("all"); }}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-all"
+                style={{
+                  background: effectiveSource === "all" ? "rgba(107,94,199,0.12)" : "transparent",
+                  color: effectiveSource === "all" ? "#6b5ec7" : "#4a5070",
+                  border: effectiveSource === "all" ? "1px solid rgba(107,94,199,0.3)" : "1px solid transparent",
+                }}
+              >
+                <Search size={13} />
+                <span>Gabungan</span>
+                <span className="opacity-60">({baseDisplayPosts.length})</span>
+              </button>
+              {sourceOptions.map(opt => {
+                const active = effectiveSource === opt.label;
+                return (
+                  <button
+                    key={opt.label}
+                    onClick={() => { setActiveSource(opt.label); setActiveTab("all"); }}
+                    className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-all"
+                    style={{
+                      background: active ? "rgba(29,122,71,0.1)" : "transparent",
+                      color: active ? "#1d7a47" : "#4a5070",
+                      border: active ? "1px solid rgba(29,122,71,0.25)" : "1px solid transparent",
+                    }}
+                  >
+                    <Hash size={13} />
+                    <span>{opt.label}</span>
+                    <span className="opacity-60">({opt.count})</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
           {/* Tab filter */}
           <div className="glass rounded-2xl p-2 flex gap-1 flex-wrap">
             {tabKeys.map(k => {
@@ -760,8 +884,21 @@ export default function DeepSearchPage() {
             })}
           </div>
 
-          <div className="flex justify-end">
-            <DownloadButton data={displayPosts} filename={`fb-deep-${query || "search"}-${new Date().toISOString().slice(0, 10)}`} label="Download Semua Hasil" />
+          <div className="flex justify-end gap-2">
+            <button
+              onClick={() => downloadJSON(displayPosts, `fb-deep-${query || "search"}-${new Date().toISOString().slice(0, 10)}`)}
+              className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-all hover:bg-purple-50"
+              style={{ background: "rgba(107,94,199,0.07)", color: "#6b5ec7", border: "1px solid rgba(107,94,199,0.2)" }}
+            >
+              <FileText size={15} /> Download JSON
+            </button>
+            <button
+              onClick={() => downloadCSV(displayPosts, `fb-deep-${query || "search"}-${new Date().toISOString().slice(0, 10)}`)}
+              className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-all hover:bg-green-50"
+              style={{ background: "rgba(29,122,71,0.07)", color: "#1d7a47", border: "1px solid rgba(29,122,71,0.2)" }}
+            >
+              <FileText size={15} /> Download CSV
+            </button>
           </div>
 
           {/* Post list */}
@@ -777,7 +914,7 @@ export default function DeepSearchPage() {
                   <span className="text-sm font-normal opacity-60">({items.length})</span>
                 </h2>
                 {items.map((post, idx) => (
-                  <PostCard key={post.url || `${k}-${idx}`} post={post} idx={idx} />
+                  <PostCard key={post.url || `${k}-${idx}`} post={post} idx={idx} onScrapePost={handleScrapePost} />
                 ))}
               </div>
             );

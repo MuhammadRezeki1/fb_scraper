@@ -178,12 +178,14 @@ export const api = {
       url: string,
       max_comments = 200,
       include_replies = true,
-      all_comments = false
+      all_comments = false,
+      scrape_reactors = false,
+      max_reactors = 200
     ) =>
       wrap(
         await runScrapeJob<PostResult>(
           "/scrape/post",
-          { url, max_comments, include_replies, all_comments },
+          { url, max_comments, include_replies, all_comments, scrape_reactors, max_reactors },
           { timeoutMs: all_comments ? 3_600_000 : 900_000, pollMs: all_comments ? 5000 : 3000 }
         )
       ),
@@ -268,6 +270,8 @@ export const api = {
         min_likes?: number;
         min_comments?: number;
         min_views?: number;
+        recent_days?: number;
+        fast_mode?: boolean;
       } = {}
     ) =>
       request<ApiResponse<{ job_id: string; mode: string; query: string }>>(
@@ -290,6 +294,8 @@ export const api = {
         min_likes?: number;
         min_comments?: number;
         min_views?: number;
+        recent_days?: number;
+        fast_mode?: boolean;
       } = {}
     ) =>
       request<ApiResponse<{ job_id: string; mode: string; query: string }>>(
@@ -311,6 +317,8 @@ export const api = {
         min_likes?: number;
         min_comments?: number;
         min_views?: number;
+        recent_days?: number;
+        fast_mode?: boolean;
       } = {}
     ) =>
       request<ApiResponse<{ job_id: string; mode: string; query: string }>>(
@@ -507,7 +515,34 @@ export interface SentimentSummary {
   avg_ml_confidence: number;
   decision_source_breakdown: Record<string, number>;
   top_liked_comments: Comment[];
-  most_active_users: Array<{ username: string; count: number }>;
+  most_active_users: MostActiveUser[];
+}
+
+export interface ActiveUserExample {
+  number: number;
+  text: string;
+  is_reply?: boolean;
+  reply_to?: string;
+  like_count?: number;
+  category?: string;
+  sentiment?: string;
+  timestamp?: string;
+}
+
+export interface MostActiveUser {
+  username: string;
+  count: number;
+  comments_count?: number;
+  replies_count?: number;
+  total_likes?: number;
+  reply_targets?: Array<{ username: string; count: number }>;
+  examples?: ActiveUserExample[];
+}
+
+export interface Reactor {
+  name: string;
+  profile_url: string;
+  reaction_type?: string;
 }
 
 export interface PostResult {
@@ -524,6 +559,9 @@ export interface PostResult {
   media_urls?: string[];
   location?: string;
   total_likes: number;
+  reactors?: Reactor[];
+  reactors_count?: number;
+  reactors_scrape_failed?: boolean;
   total_comments: number;
   total_shares: number;
   total_saves?: number | null;
@@ -709,6 +747,9 @@ export interface DeepPost {
   shares_count: number;
   deep_source?: string;
   deep_source_tag?: string;
+  deep_root_query?: string;
+  deep_root_tag?: string;
+  deep_query?: string;
   rank?: number;
   source?: string;
   // v4: comment scraping fields

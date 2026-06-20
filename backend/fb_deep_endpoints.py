@@ -79,6 +79,24 @@ def _extract_sort_filter(data: dict) -> dict:
         except (ValueError, TypeError):
             pass
 
+    detail_limit = data.get("detail_enrich_limit")
+    if detail_limit is not None:
+        try:
+            result["detail_enrich_limit"] = max(0, int(detail_limit))
+        except (ValueError, TypeError):
+            pass
+
+    recent_days = data.get("recent_days")
+    if recent_days is not None:
+        try:
+            result["recent_days"] = max(0, int(recent_days))
+        except (ValueError, TypeError):
+            pass
+
+    fast_mode = data.get("fast_mode")
+    if fast_mode is not None:
+        result["fast_mode"] = bool(fast_mode) if isinstance(fast_mode, bool) else str(fast_mode).strip().lower() in {"1", "true", "yes", "on"}
+
     return result
 
 

@@ -9,6 +9,8 @@ venv/
 # Node
 node_modules/
 .next/
+.next.bad*/
+frontend/.next.bad*/
 
 # Chrome profiles (large binary data)
 fb_chrome_real_profile/

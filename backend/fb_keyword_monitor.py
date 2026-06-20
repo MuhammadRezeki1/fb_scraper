@@ -1,7 +1,7 @@
 import os, re, json, time, random, math, threading, uuid, html
 from datetime import datetime
 from typing import List, Dict, Optional, Set, Any, Callable
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, parse_qs
 from dotenv import load_dotenv
 from colorama import Fore, init
 from playwright.sync_api import sync_playwright, Page, BrowserContext, Response
@@ -9,6 +9,20 @@ from playwright.sync_api import sync_playwright, Page, BrowserContext, Response
 init(autoreset=True); load_dotenv()
 HEADLESS = os.getenv("FB_HEADLESS", "False").lower() == "true"
 FB_CHROME_PROFILE = os.path.join(os.getcwd(), "fb_chrome_real_profile")
+FB_BLOCK_HEAVY_RESOURCES = os.getenv("FB_BLOCK_HEAVY_RESOURCES", "true").lower() == "true"
+FB_PER_TYPE_MIN = int(os.getenv("FB_PER_TYPE_MIN", "60"))
+FB_SEARCH_PRE_SCROLLS = int(os.getenv("FB_SEARCH_PRE_SCROLLS", "2"))
+FB_FEED_MAX_ROUNDS = int(os.getenv("FB_FEED_MAX_ROUNDS", "18"))
+FB_FEED_WAIT_ROUNDS = int(os.getenv("FB_FEED_WAIT_ROUNDS", "4"))
+FB_GENERIC_MAX_ROUNDS = int(os.getenv("FB_GENERIC_MAX_ROUNDS", "16"))
+FB_DETAIL_ENRICH_LIMIT = int(os.getenv("FB_DETAIL_ENRICH_LIMIT", "24"))
+FB_DETAIL_WAIT_SECONDS = float(os.getenv("FB_DETAIL_WAIT_SECONDS", "1.2"))
+FB_WARMUP_SECONDS = float(os.getenv("FB_WARMUP_SECONDS", "3"))
+FB_HOME_LOAD_SECONDS = float(os.getenv("FB_HOME_LOAD_SECONDS", "1.5"))
+FB_SEARCH_LOAD_SECONDS = float(os.getenv("FB_SEARCH_LOAD_SECONDS", "1.2"))
+FB_SEARCH_SCROLL_DELAY = float(os.getenv("FB_SEARCH_SCROLL_DELAY", "0.35"))
+FB_TYPE_SWITCH_DELAY = float(os.getenv("FB_TYPE_SWITCH_DELAY", "0.25"))
+FB_PAGE_DEEP_OPEN_LIMIT = int(os.getenv("FB_PAGE_DEEP_OPEN_LIMIT", "0"))
 os.makedirs("output_facebook", exist_ok=True); os.makedirs("fb_keyword_debug", exist_ok=True)
 
 def _engagement_score(item):
@@ -41,10 +55,6 @@ def _is_commentable_url(url):
     return False
 
 def _is_valid_result_url(url):
-    """
-    Terima hanya URL post/video/photo nyata di Facebook.
-    BARU: buang hashtag pages, profile/group homepage tanpa konten spesifik.
-    """
     if not url:
         return False
     u = url.lower()
@@ -55,11 +65,15 @@ def _is_valid_result_url(url):
         if blocked in u:
             return False
 
+    # ✅ FIX: support format share baru FB (share/p/, share/v/, share/r/)
+    if re.search(r'/share/(p|v|r)/[a-z0-9_-]+', u):
+        return True
+
     # Photo dengan fbid
     if 'facebook.com/photo/?fbid=' in u or re.search(r'/photo/\?fbid=\d+', u):
         return True
-    # Watch video
-    if re.search(r'/watch/?\?v=\d+', u):
+    # Watch video, including live permalink surface.
+    if '/watch' in u and re.search(r'[?&]v=\d+', u):
         return True
     # Group post (bukan group homepage)
     if re.search(r'/groups/[^/]+/(posts|permalink)/\d+', u):
@@ -156,11 +170,75 @@ def _normalize_fb_url(url: str) -> str:
     if url.startswith("/"):
         url = "https://www.facebook.com" + url
     url = url.replace("https://m.facebook.com", "https://www.facebook.com")
+    try:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        if "facebook.com" in host:
+            path = parsed.path or ""
+            qs = parse_qs(parsed.query or "")
+            video_id = (qs.get("v") or [""])[0]
+            if video_id and "/watch" in path:
+                return f"https://www.facebook.com/watch/?v={video_id}"
+            m = re.search(r"(/[^/?#]+/videos/(\d+))", path)
+            if m:
+                return f"https://www.facebook.com{m.group(1)}/"
+    except Exception:
+        pass
     return url.split("#")[0]
+
+def _fb_content_key(url: str) -> str:
+    """Stable key for deduping equivalent FB surfaces, e.g. watch/live vs /videos/id."""
+    u = _normalize_fb_url(url or "")
+    if not u:
+        return ""
+    try:
+        parsed = urlparse(u)
+        path = parsed.path or ""
+        qs = parse_qs(parsed.query or "")
+        video_id = (qs.get("v") or [""])[0]
+        if not video_id:
+            m = re.search(r"/(?:videos?|watch|reels?|reel)/(\d+)", path)
+            video_id = m.group(1) if m else ""
+        if video_id:
+            return f"video:{video_id}"
+        photo_id = (qs.get("fbid") or [""])[0]
+        if photo_id:
+            return f"photo:{photo_id}"
+        story_id = (qs.get("story_fbid") or [""])[0]
+        if story_id:
+            return f"story:{story_id}"
+    except Exception:
+        pass
+    return u.split("#")[0].rstrip("/")
+
+def _is_canonical_video_permalink(url: str) -> bool:
+    return bool(re.search(r"facebook\.com/[^/?#]+/videos/\d+", url or "", re.I))
 
 def _looks_like_media_url(url: str) -> bool:
     u = (url or "").lower()
     return bool(u) and ("scontent" in u or "fbcdn" in u) and bool(re.search(r'\.(jpg|jpeg|png|webp)(?:\?|$)', u))
+
+def _parse_compact_number(value: str) -> int:
+    if value is None:
+        return 0
+    raw = str(value).lower()
+    raw = (raw.replace("\u00a0", " ")
+              .replace("\xa0", " ")
+              .replace("Â", " ")
+              .replace("�", " "))
+    m = re.search(r'([\d]+(?:[.,][\d]+)?)(?:\s*(ribu|juta|mio|mn|rb|jt|k|m)(?![a-z]))?', raw, re.I)
+    if not m:
+        return 0
+    try:
+        n = float(m.group(1).replace(".", "").replace(",", "."))
+    except ValueError:
+        return 0
+    suffix = (m.group(2) or "").lower()
+    if suffix in ("rb", "ribu", "k"):
+        n *= 1_000
+    elif suffix in ("jt", "juta", "m", "mio", "mn"):
+        n *= 1_000_000
+    return int(n)
 
 class FacebookKeywordMonitor:
     def __init__(self):
@@ -190,11 +268,44 @@ class FacebookKeywordMonitor:
 
     def _new_page(self):
         p=self.ctx.new_page()
+        try:
+            p.set_default_timeout(15000)
+            p.set_default_navigation_timeout(22000)
+        except Exception:
+            pass
         p.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
                           "window.chrome={runtime:{},csi:function(){return{}},loadTimes:function(){return{}}};"
                           "Object.defineProperty(navigator,'languages',{get:()=>['id-ID','id','en-US','en']});"
                           "Object.defineProperty(navigator,'platform',{get:()=>'Win32'});")
         return p
+
+    def _install_resource_blocking(self, context: BrowserContext):
+        if not FB_BLOCK_HEAVY_RESOURCES:
+            return
+        def block_heavy(route):
+            try:
+                req = route.request
+                resource_type = req.resource_type
+                url = req.url.lower()
+                if resource_type in ("image", "media", "font"):
+                    route.abort()
+                    return
+                if any(x in url for x in [
+                    "/ajax/bz", "/logging/", "/analytics", "/tr/?", "doubleclick",
+                    "google-analytics", "facebook.com/impression.php",
+                ]):
+                    route.abort()
+                    return
+                route.continue_()
+            except Exception:
+                try:
+                    route.continue_()
+                except Exception:
+                    pass
+        try:
+            context.route("**/*", block_heavy)
+        except Exception:
+            pass
 
     def _setup_gql(self, page: Page):
         sid = str(uuid.uuid4())[:8]
@@ -224,6 +335,7 @@ class FacebookKeywordMonitor:
             locale="id-ID",timezone_id="Asia/Jakarta",bypass_csp=True)
         def _apply(p): p.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         context.on("page",_apply)
+        self._install_resource_blocking(context)
         return context
 
     def _is_logged_in(self):
@@ -248,11 +360,11 @@ class FacebookKeywordMonitor:
         self._current_gql_session, self._gql, self._gql_urls = self._setup_gql(self.pg)
         print(Fore.CYAN+"   [..] Membuka homepage...")
         self.pg.goto("https://www.facebook.com/",wait_until="domcontentloaded",timeout=30000)
-        time.sleep(4)
+        time.sleep(FB_HOME_LOAD_SECONDS)
         cu=self.pg.url
         if "login" in cu or "checkpoint" in cu: print(Fore.RED+"   [FAIL] Redirect login!");self.close();raise Exception("FB session expired")
         if not self._is_logged_in(): print(Fore.RED+"   [FAIL] Belum login!");self.close();raise Exception("FB not logged in")
-        self._warmup_browser(10);self._warmed_up=True
+        self._warmup_browser(FB_WARMUP_SECONDS);self._warmed_up=True
         print(Fore.GREEN+"[OK] Browser siap (LOGGED IN)")
 
     def close(self):
@@ -265,8 +377,15 @@ class FacebookKeywordMonitor:
     def _warmup_browser(self,s=10):
         if self._warmed_up: return
         print(Fore.YELLOW+f"\n   [WARMUP] {s}s...")
-        for _ in range(2): self.pg.evaluate(f"window.scrollBy(0,{random.randint(300,800)})");time.sleep(random.uniform(1.5,3))
-        self.pg.evaluate("window.scrollTo(0,0)");time.sleep(1.5)
+        if s <= 0:
+            return
+        rounds = 1 if s <= 4 else 2
+        delay = min(1.0, max(0.2, s / max(3, rounds * 3)))
+        for _ in range(rounds):
+            self.pg.evaluate(f"window.scrollBy(0,{random.randint(300,800)})")
+            time.sleep(delay)
+        self.pg.evaluate("window.scrollTo(0,0)")
+        time.sleep(min(0.8, delay))
     def _close_popups(self,page=None):
         p=page or self.pg
         try: p.evaluate("()=>{document.querySelectorAll('[aria-label=\"Tutup\"],[aria-label=\"Close\"]').forEach(b=>{if(b.offsetParent!==null)b.click()})}");time.sleep(0.5)
@@ -280,8 +399,9 @@ class FacebookKeywordMonitor:
         for rd in gql_data:
             try:
                 for item in self._recursive_extract(rd.get("data",{}),keyword,strict):
-                    if item.get("url","") and item["url"] not in seen_urls:
-                        seen_urls.add(item["url"]); results.append(item)
+                    key = _fb_content_key(item.get("url", "")) or item.get("url", "")
+                    if item.get("url","") and key not in seen_urls:
+                        seen_urls.add(key); results.append(item)
             except: continue
         return results
 
@@ -350,16 +470,30 @@ class FacebookKeywordMonitor:
                         if comments > 0:
                             break
 
-            # Shares — cek share_count, reshare_count, lalu node langsung
+            # Shares — cek berbagai key GQL yang digunakan FB
             shares = 0
             if isinstance(fb, dict):
-                share_obj = fb.get("share_count") or fb.get("reshare_count") or {}
-                if isinstance(share_obj, dict):
-                    shares = int(share_obj.get("count", 0) or 0)
-                elif isinstance(share_obj, int):
-                    shares = share_obj
+                # Coba semua key shares yang diketahui
+                for share_key in ["share_count", "reshare_count", "shares", "reshares"]:
+                    share_obj = fb.get(share_key)
+                    if share_obj is None:
+                        continue
+                    if isinstance(share_obj, dict):
+                        v = int(share_obj.get("count", 0) or 0)
+                        if v > 0:
+                            shares = v
+                            break
+                    elif isinstance(share_obj, int) and share_obj > 0:
+                        shares = share_obj
+                        break
             if shares == 0:
-                shares = int(node.get("share_count", 0) or node.get("reshare_count", 0) or 0)
+                # Fallback ke node level langsung
+                for k in ["share_count", "reshare_count", "shares_count"]:
+                    v = node.get(k)
+                    if v:
+                        shares = int(v or 0)
+                        if shares > 0:
+                            break
 
             # Views (video)
             views = 0
@@ -423,7 +557,9 @@ class FacebookKeywordMonitor:
             r'"(?:wwwURL|url)"\s*:\s*"([^"]*(?:facebook\.com)?/(?:videos?|reels?)/\d+[^"]*)"',
             r'"(?:wwwURL|url)"\s*:\s*"([^"]*(?:facebook\.com)?/groups/[^/]+/(?:posts|permalink)/\d+[^"]*)"',
             r'"(?:wwwURL|url)"\s*:\s*"([^"]*story_fbid=\d+[^"]*)"',
-            r'href="([^"]*(?:/watch/?\?v=|/photo/?\?fbid=|/(?:posts|permalink|videos?|reels?)/\d+|/groups/[^/]+/posts/\d+|story_fbid=)[^"]*)"',
+            # ✅ FIX: format share baru FB
+            r'"(?:wwwURL|url)"\s*:\s*"([^"]*(?:facebook\.com)?/share/(?:p|v|r)/[a-zA-Z0-9_-]+[^"]*)"',
+            r'href="([^"]*(?:/watch/?\?v=|/photo/?\?fbid=|/(?:posts|permalink|videos?|reels?)/\d+|/groups/[^/]+/posts/\d+|story_fbid=|/share/(?:p|v|r)/)[^"]*)"',
         ]
 
         candidates = []
@@ -437,13 +573,14 @@ class FacebookKeywordMonitor:
                 break
 
             url = _normalize_fb_url(raw_url)
-            if not url or url in seen:
+            content_key = _fb_content_key(url) or url
+            if not url or content_key in seen:
                 continue
 
             if not _is_valid_result_url(url):
                 continue
 
-            seen.add(url)
+            seen.add(content_key)
 
             window = html_text[max(0, pos - 8000):pos + 10000]
 
@@ -485,6 +622,17 @@ class FacebookKeywordMonitor:
                     "see more", "facebook watch", "watch video",
                 ]):
                     texts.append(clean)
+
+            # ✅ FIX: juga cek "message", "title", "description", "story" fields untuk video/reel
+            for field in ["message", "title", "description", "story", "body_text"]:
+                for t in re.findall(rf'"{field}"\s*:\s*\{{"text"\s*:\s*"([^"]+)"', window):
+                    clean = _decode_fb_string(t)
+                    if clean and len(clean) > 8 and clean not in texts:
+                        texts.insert(0, clean)  # prioritaskan
+                for t in re.findall(rf'"{field}"\s*:\s*"([^"{{][^"]{8,2000})"', window):
+                    clean = _decode_fb_string(t)
+                    if clean and len(clean) > 8 and clean not in texts:
+                        texts.append(clean)
 
             if keyword:
                 kw_lower = keyword.lower().lstrip("#").strip()
@@ -555,42 +703,50 @@ class FacebookKeywordMonitor:
         """
         Extract angka engagement dari teks bebas.
         """
-        text = (text or "").lower().replace("\u00a0", " ")
+        text = (text or "").lower()
+        text = (text.replace("\u00a0", " ")
+                    .replace("\xa0", " ")
+                    .replace("Â", " ")
+                    .replace("�", " "))
         label_pat = "|".join(re.escape(x.lower()) for x in labels)
 
         def _parse(num_str, suffix):
-            try:
-                n = float(num_str.replace(".", "").replace(",", "."))
-            except ValueError:
-                return 0
-            sf = (suffix or "").lower().strip()
-            if sf in ("rb", "ribu", "k"):
-                n *= 1_000
-            elif sf in ("jt", "juta", "m", "mio", "mn"):
-                n *= 1_000_000
-            return int(n)
+            return _parse_compact_number(f"{num_str or ''} {suffix or ''}")
 
         SFX = r"(rb|ribu|k|jt|juta|m|mio|mn)?"
 
+        # Pola khusus untuk shares: "N kali dibagikan" / "dibagikan N kali"
+        if any(x in labels for x in ["dibagikan", "shares", "share", "bagikan"]):
+            special_patterns = [
+                r'([\d.,]+)\s*' + SFX + r'\s*kali\s+dibagikan',
+                r'dibagikan\s+([\d.,]+)\s*' + SFX + r'\s*kali',
+                r'([\d.,]+)\s*' + SFX + r'\s*x\s+dibagikan',
+            ]
+            for pat in special_patterns:
+                m = re.search(pat, text, re.I)
+                if m:
+                    val = _parse(m.group(1), m.group(2) or "")
+                    if val > 0: return val
+
         m = re.search(rf'([\d.,]+)\s*{SFX}\s*(?:{label_pat})', text, re.I)
         if m:
-            r = _parse(m.group(1), m.group(2) or "")
-            if r > 0: return r
+            val = _parse(m.group(1), m.group(2) or "")
+            if val > 0: return val
 
         m = re.search(rf'(?:{label_pat})\s*[:\-]?\s*([\d.,]+)\s*{SFX}', text, re.I)
         if m:
-            r = _parse(m.group(1), m.group(2) or "")
-            if r > 0: return r
+            val = _parse(m.group(1), m.group(2) or "")
+            if val > 0: return val
 
         m = re.search(rf'([\d.,]+)\s*{SFX}\s*[·•]\s*(?:{label_pat})', text, re.I)
         if m:
-            r = _parse(m.group(1), m.group(2) or "")
-            if r > 0: return r
+            val = _parse(m.group(1), m.group(2) or "")
+            if val > 0: return val
 
         m = re.search(rf'(?:{label_pat})\s*[·•]\s*([\d.,]+)\s*{SFX}', text, re.I)
         if m:
-            r = _parse(m.group(1), m.group(2) or "")
-            if r > 0: return r
+            val = _parse(m.group(1), m.group(2) or "")
+            if val > 0: return val
 
         return 0
 
@@ -598,14 +754,30 @@ class FacebookKeywordMonitor:
     #  FEED EXTRACTION
     # ======================================================================
     def _extract_feed(self, page, max_items=100, keyword=""):
-        results=[]; seen_urls=set(); stable=0; mx=80; ms=6
+        results=[]; seen_urls=set(); stable=0
+        mx=max(4, min(FB_FEED_MAX_ROUNDS, math.ceil(max_items / 6) + 4))
+        ms=4
         has_feed=False
-        for _ in range(8):
+        for _ in range(max(1, FB_FEED_WAIT_ROUNDS)):
             try:
-                c=page.evaluate("document.querySelectorAll('[role=\"feed\"] [aria-posinset]').length")
-                if c>0: print(Fore.GREEN+f"   [FEED] {c} posts"); has_feed=True; break
+                c=page.evaluate("""() => {
+                    // ✅ FIX: cek berbagai selector feed FB (struktur berubah berkala)
+                    const posinset = document.querySelectorAll('[role="feed"] [aria-posinset]').length;
+                    const articles = document.querySelectorAll('[role="feed"] [role="article"]').length;
+                    const feedDivs = document.querySelectorAll('[role="feed"]>div').length;
+                    return Math.max(posinset, articles, feedDivs);
+                }""")
+                if c>0: print(Fore.GREEN+f"   [FEED] {c} items found"); has_feed=True; break
             except: pass
-            time.sleep(1)
+            time.sleep(0.5)
+        if not has_feed:
+            # ✅ FIX: Cek apakah ada artikel meski tidak ada feed element
+            try:
+                art_count = page.evaluate("document.querySelectorAll('[role=\"article\"]').length")
+                if art_count > 0:
+                    print(Fore.YELLOW+f"   [FEED] No [role=feed] tapi ada {art_count} articles, pakai article-based extraction...")
+                    has_feed = True
+            except: pass
         if not has_feed:
             print(Fore.YELLOW+"   [FEED] No feed element found, trying generic extraction...")
             return self._extract_generic(page, max_items, "posts", keyword)
@@ -643,6 +815,10 @@ class FacebookKeywordMonitor:
                 }
                 if(!raw.startsWith('/'))raw='/'+raw;
                 if(raw.includes('/stories/'))return '';
+                // ✅ FIX: support format share baru FB
+                if(/\/share\/(p|v|r)\/([A-Za-z0-9_-]+)/.test(raw)){
+                    return 'https://www.facebook.com'+raw.split('#')[0];
+                }
                 if(raw.includes('/watch/')&&raw.includes('v=')){
                     const m=raw.match(/[?&]v=(\d+)/);
                     if(m)return 'https://www.facebook.com/watch/?v='+m[1];
@@ -672,6 +848,8 @@ class FacebookKeywordMonitor:
                     else if(/\/(posts|permalink)\/\d+/.test(h))score=55;
                     else if((h.includes('/photo/')||h.includes('/photo?'))&&h.includes('fbid='))score=50;
                     else if(/\/(photo|photos)\/\d+/.test(h))score=45;
+                    // ✅ FIX: tambah format share baru FB
+                    else if(/\/share\/(p|v|r)\/[A-Za-z0-9_-]+/.test(h))score=48;
                     else if(/profile\.php\?id=\d+/.test(h))score=35;
                     else if(/facebook\.com\/[a-zA-Z0-9._-]{3,}\/?$/.test(h))score=30;
                     else if(/\/(reel|reels|videos|video)\/\d+/.test(h)||h.includes('/watch/?v='))score=20;
@@ -683,7 +861,18 @@ class FacebookKeywordMonitor:
                 }
                 return best||'';
             };
-            document.querySelectorAll('[role="feed"] [aria-posinset],[role="feed"]>div>div>div>div').forEach(c=>{
+            // ✅ FIX: selector lebih luas — cover semua variasi struktur FB feed + article fallback
+            const feedContainers=[
+                ...document.querySelectorAll('[role="feed"] [aria-posinset]'),
+                ...document.querySelectorAll('[role="feed"] [role="article"]'),
+                ...document.querySelectorAll('[role="feed"]>div>div>div>div'),
+                ...Array.from(document.querySelectorAll('[role="article"]')).filter(a=>{
+                    const al=(a.getAttribute('aria-label')||'').toLowerCase();
+                    return !al.includes('komentar')&&!al.includes('comment')&&!al.includes('balasan');
+                })
+            ];
+            const seen_c=new Set();
+            feedContainers.filter(c=>{if(seen_c.has(c))return false;seen_c.add(c);return true;}).forEach(c=>{
                 try{
                     const ls=c.querySelectorAll('a[href*="/"]');
                     let url=pickContentUrl(ls),author='',txt='';
@@ -702,10 +891,10 @@ class FacebookKeywordMonitor:
                     const fullText=(c.innerText||'').replace(/\u00a0/g,' ');
                     const vm=fullText.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio)?)\s*(?:tayangan|views|ditonton)/i);
                     if(vm)views=parseNum(vm[0]);
-                    c.querySelectorAll('div[role="button"],span[role="button"]').forEach(el=>{
+                    c.querySelectorAll('div[role="button"],span[role="button"],a[role="button"]').forEach(el=>{
                         const aria=(el.getAttribute('aria-label')||'').toLowerCase();
                         let tx=(el.innerText||'').trim();
-                        if(aria.includes('suka')||aria.includes('like')||aria.includes('react')){
+                        if(aria.includes('suka')||aria.includes('like')||aria.includes('react')||aria.includes('reaksi')){
                             const childSpan=el.querySelector('span[dir="auto"]');
                             if(childSpan)tx=(childSpan.innerText||'').trim();
                             likes=Math.max(likes,parseNum(tx||aria));
@@ -715,12 +904,18 @@ class FacebookKeywordMonitor:
                             if(childSpan)tx=(childSpan.innerText||'').trim();
                             comms=Math.max(comms,parseNum(tx||aria));
                         }
-                        if(aria.includes('bagikan')||aria.includes('share')){
+                        if(aria.includes('bagikan')||aria.includes('share')||aria.includes('kirim')){
                             const childSpan=el.querySelector('span[dir="auto"]');
                             if(childSpan)tx=(childSpan.innerText||'').trim();
-                            shares=Math.max(shares,parseNum(tx||aria));
+                            const num=parseNum(tx||aria);
+                            if(num>0)shares=Math.max(shares,num);
                         }
                     });
+                    // Fallback shares: cari pola teks dalam artikel
+                    if(!shares){
+                        const sm=fullText.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio)?)\s*(?:kali\s+dibagikan|x\s+dibagikan|dibagikan|shares?)\b/i);
+                        if(sm)shares=parseNum(sm[0]);
+                    }
                     const images=extractImages(c);
                     s.add(url);
                     r.push({url,author:author||'Unknown',text:txt.slice(0,1000),caption:txt.slice(0,1000),
@@ -739,10 +934,11 @@ class FacebookKeywordMonitor:
             n=0
             for item in batch:
                 u=item.get('url','')
-                if not u or u in seen_urls or not _is_valid_result_url(u): continue
+                key = _fb_content_key(u) or u
+                if not u or key in seen_urls or not _is_valid_result_url(u): continue
                 if keyword and not _keyword_in_item(item, keyword):
                     continue
-                seen_urls.add(u); results.append(item); n+=1
+                seen_urls.add(key); results.append(item); n+=1
             if rnd%5==0 or n>0: print(Fore.CYAN+f"   [FEED] R{rnd+1}: {len(results)}(+{n})")
             if n==0: stable+=1
             else: stable=0
@@ -755,7 +951,7 @@ class FacebookKeywordMonitor:
     #  GENERIC SCROLL EXTRACTION
     # ======================================================================
     def _extract_generic(self, page, max_items=100, search_type="videos", keyword=""):
-        results=[]; seen_urls=set(); stable=0; ms=4
+        results=[]; seen_urls=set(); stable=0; ms=6 if search_type == "videos" else 4
 
         print(Fore.CYAN+f"   [GENERIC] Using universal scroll extraction for {search_type}...")
 
@@ -765,11 +961,19 @@ class FacebookKeywordMonitor:
         if search_type == "pages":
             return self._extract_page_posts(page, max_items, keyword)
 
-        mx = 60
+        mx = max(4, min(FB_GENERIC_MAX_ROUNDS + (4 if search_type == "videos" else 0), math.ceil(max_items / 6) + (8 if search_type == "videos" else 4)))
         _JS_GENERIC = r"""
         (args) => {
             const st=args.searchType||'posts'; const kw=(args.keyword||'').toLowerCase();
             const r=[]; const s=new Set();
+            const clean=(text)=>(text||'').replace(/\u00a0|\xa0|Â|�/g,' ').replace(/\s+/g,' ').trim();
+            const compact=(text)=>clean(text).toLowerCase().replace(/[\s_-]+/g,'');
+            const kwCompact=compact(kw);
+            const kwMatch=(text)=>{
+                if(!kw)return true;
+                const low=clean(text).toLowerCase();
+                return low.includes(kw)||Boolean(kwCompact&&kwCompact.length>=3&&compact(low).includes(kwCompact));
+            };
             const parseNum=(text)=>{
                 const m=(text||'').toLowerCase().replace(/\u00a0/g,' ').match(/([\d.,]+)\s*(rb|ribu|k|jt|juta|m|mio)?/i);
                 if(!m)return 0;
@@ -798,9 +1002,14 @@ class FacebookKeywordMonitor:
                 }
                 if(!raw.startsWith('/'))raw='/'+raw;
                 if(raw.includes('/stories/'))return '';
-                if(raw.includes('/watch/')&&raw.includes('v=')){
+                // ✅ FIX: support /watch/ dengan berbagai query param format
+                if(raw.includes('/watch')&&raw.includes('v=')){
                     const m=raw.match(/[?&]v=(\d+)/);
                     if(m)return 'https://www.facebook.com/watch/?v='+m[1];
+                }
+                // ✅ FIX: format share baru FB
+                if(/\/share\/(p|v|r)\/[A-Za-z0-9_-]+/.test(raw)){
+                    return 'https://www.facebook.com'+raw.split('#')[0].split('?')[0];
                 }
                 if(raw.includes('/photo/')&&raw.includes('fbid=')){
                     const m=raw.match(/[?&]fbid=(\d+)/);
@@ -822,7 +1031,9 @@ class FacebookKeywordMonitor:
                 let n=0;
                 node.querySelectorAll('a[href]').forEach(x=>{
                     const h=x.getAttribute('href')||'';
-                    if(!h.includes('/stories/')&&(/\/(posts|permalink|photo|videos|video|reel|reels)\/\d+/.test(h)||h.includes('/watch/?v=')||(h.includes('/photo/')&&h.includes('fbid='))))n++;
+                    // ✅ FIX: cek /watch dengan v= param di posisi manapun
+                    const isWatch=h.includes('/watch')&&/[?&]v=\d/.test(h);
+                    if(!h.includes('/stories/')&&(/\/(posts|permalink|photo|videos|video|reel|reels)\/\d+/.test(h)||isWatch||(h.includes('/photo/')&&h.includes('fbid='))))n++;
                 });
                 return n;
             };
@@ -843,19 +1054,88 @@ class FacebookKeywordMonitor:
                 return best||a.parentElement;
             };
             const badText=(t)=>{
-                const x=(t||'').trim().toLowerCase();
+                const x=clean(t).toLowerCase();
                 if(!x)return true;
                 if(x===kw||x==='videos'||x==='reels'||x==='watch'||x==='lihat selengkapnya')return true;
                 if(/^(like|comment|share|suka|komentar|bagikan|\d+:\d+)$/.test(x))return true;
                 return false;
             };
+            const metricNums=(text)=>{
+                return [...clean(text).matchAll(/([\d]+(?:[.,][\d]+)?)(?:\s*(rb|ribu|k|jt|juta|m|mio|mn)(?![a-z]))?/gi)]
+                    .map(m=>parseNum(`${m[1]} ${m[2]||''}`))
+                    .filter(n=>n>0&&n<1000000000);
+            };
+            const extractArticleVideos=()=>{
+                if(st!=='videos')return;
+                const cards=[...document.querySelectorAll('[role="article"], [aria-posinset]')];
+                cards.forEach(card=>{
+                    try{
+                        const links=[...card.querySelectorAll('a[href]')];
+                        const videoLinks=links.filter(a=>{
+                            const h=a.getAttribute('href')||'';
+                            if(!h||h.includes('/search/')||h.includes('/stories/'))return false;
+                            return (h.includes('/watch')&&/[?&]v=\d/.test(h))||/\/(?:videos?|reels?)\/\d+/.test(h)||/\/reel\/\d+/.test(h);
+                        });
+                        if(!videoLinks.length)return;
+                        const best=videoLinks.find(a=>!badText(a.innerText||a.getAttribute('aria-label')||''))||videoLinks[0];
+                        const url=normalizeUrl(best.getAttribute('href')||best.href||'');
+                        if(!url||s.has(url))return;
+                        const stripDuration=(text)=>clean(text).replace(/^(\d+:)?\d+:\d+(?:\s*\/\s*(\d+:)?\d+:\d+)?\s*/,'').trim();
+                        const fullText=clean(card.innerText||best.innerText||best.getAttribute('aria-label')||'');
+                        if(kw&&!kwMatch(fullText)&&!kwMatch(best.innerText||'')&&!((best.getAttribute('href')||'').toLowerCase().includes(`q=${encodeURIComponent(kw)}`)))return;
+                        const lines=fullText.split(/\n+/).map(clean).filter(Boolean);
+                        const titleLine=stripDuration(lines.find(line=>line.length>8&&!badText(line)&&!/^(\d+:)?\d+:\d+/.test(line))||best.innerText||'');
+                        const textParts=lines.filter(line=>
+                            line.length>8&&
+                            !badText(line)&&
+                            !/^(\d+:)?\d+:\d+/.test(line)&&
+                            !/^(ikuti|follow|diverifikasi|verified)$/i.test(line)
+                        );
+                        const caption=stripDuration(textParts.join(' ').slice(0,1200)||titleLine);
+                        let author='';
+                        const authorLink=links.find(a=>{
+                            const h=a.getAttribute('href')||'';
+                            const t=clean(a.innerText||'');
+                            return t.length>2&&t.length<90&&!/\/watch|\/reel|\/video|\/search/.test(h)&&!/^\d/.test(t)&&!badText(t);
+                        });
+                        if(authorLink)author=clean(authorLink.innerText||'').slice(0,100);
+                        let likes=0,comms=0,views=0,shares=0;
+                        const lm=fullText.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:suka|likes?|reaksi|reactions?)/i);
+                        const cm=fullText.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:komentar|comments?)/i);
+                        const vm=fullText.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:tayangan|views?|ditonton|viewed)/i);
+                        const sm=fullText.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:kali\s+dibagikan|x\s+dibagikan|dibagikan|shares?)/i);
+                        if(lm)likes=parseNum(lm[1]||lm[0]);
+                        if(cm)comms=parseNum(cm[1]||cm[0]);
+                        if(vm)views=parseNum(vm[1]||vm[0]);
+                        if(sm)shares=parseNum(sm[1]||sm[0]);
+                        if(!likes&&!comms&&!views){
+                            const nums=metricNums(fullText).filter(n=>n>9);
+                            if(nums.length>=3){
+                                const tail=nums.slice(-3);
+                                likes=tail[0]; comms=tail[1]; views=tail[2];
+                            }else if(nums.length>=2){
+                                likes=nums[0]; comms=nums[1];
+                            }
+                        }
+                        const images=extractImages(card);
+                        s.add(url);
+                        r.push({url,author:author||'Unknown',text:caption,caption,
+                            timestamp:'',type:'videos',likes_count:likes||0,comments_count:comms||0,
+                            views_count:views||0,shares_count:shares||0,images,media_urls:images,media_count:images.length,
+                            engagement_score:likes+comms*2+shares*3+views*0.1,source:'generic_article',matched_via:kw ? `search:${kw}` : ''});
+                    }catch(e){}
+                });
+            };
+            extractArticleVideos();
             const allLinks=document.querySelectorAll('a[href*="/"]');
             allLinks.forEach(a=>{
                 try{
                     const h=a.getAttribute('href')||''; const ch=h.split('#')[0].split('?')[0];
                     let url='',detected='';
                     if(st==='videos'){
-                        if(/\/(videos\/|video\/|reel\/|reels\/)/.test(ch)||h.includes('/watch/?v=')){
+                        // ✅ FIX: cek v= param di semua posisi (bukan hanya /watch/?v=)
+                        const hasWatchV = h.includes('/watch')&&/[?&]v=\d/.test(h);
+                        if(/\/(videos\/|video\/|reel\/|reels\/)/.test(ch)||hasWatchV){
                             url=normalizeUrl(h);detected='videos';
                         }
                     }
@@ -874,43 +1154,93 @@ class FacebookKeywordMonitor:
                     const container=pickCard(a);
                     let author='',txt='',likes=0,comms=0,views=0,images=[];
                     if(container){
-                        const ac=container.querySelector('strong[dir="auto"],h2,h3,h4,a[role="link"]');
+                        // ✅ FIX: perkuat author extraction untuk video FB
+                        const ac=container.querySelector('strong[dir="auto"],h2,h3,h4,a[role="link"] span[dir="auto"],a[href*="facebook.com"] strong');
                         if(ac)author=(ac.innerText||'').trim().slice(0,100);
+                        if(!author){
+                            // Coba dari link teks yang bukan URL, bukan timestamp
+                            const links=container.querySelectorAll('a[href]');
+                            for(const lk of links){
+                                const lt=(lk.innerText||'').trim();
+                                if(lt&&lt.length>2&&lt.length<80&&!/^\d+[:.]?\d*$/.test(lt)&&!lt.includes('http')){
+                                    author=lt; break;
+                                }
+                            }
+                        }
                         const candidates=[];
                         container.querySelectorAll('span[dir="auto"],div[dir="auto"]').forEach(el=>{
-                            const t=(el.innerText||'').trim();
+                            const t=clean(el.innerText||'');
                             if(t.length<3||t.length>2200||t===author||badText(t))return;
                             candidates.push(t);
                         });
                         candidates.sort((a,b)=>{
-                            const ak=kw&&a.toLowerCase().includes(kw)?1:0;
-                            const bk=kw&&b.toLowerCase().includes(kw)?1:0;
+                            const ak=kwMatch(a)?1:0;
+                            const bk=kwMatch(b)?1:0;
                             if(ak!==bk)return bk-ak;
                             return b.length-a.length;
                         });
-                        txt=(candidates[0]||'').slice(0,1000);
-                        const fullText=(container.innerText||'').replace(/\u00a0/g,' ');
-                        const vm=fullText.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio)?)\s*(?:tayangan|views|ditonton)/i);
-                        if(vm)views=parseNum(vm[0]);
-                        container.querySelectorAll('[aria-label*="suka"],[aria-label*="like"],[aria-label*="react"]').forEach(el=>{
-                            let tx=(el.innerText||'').trim();
-                            const childSpan=el.querySelector('span[dir="auto"]');
-                            if(childSpan)tx=(childSpan.innerText||'').trim();
-                            likes=Math.max(likes,parseNum(tx+' '+(el.getAttribute('aria-label')||'')));
+                        txt=(candidates[0]||clean(a.innerText||a.getAttribute('aria-label')||a.getAttribute('title')||'')).slice(0,1000);
+                        // ✅ FIX: replace \xa0 (non-breaking space) sebelum parse
+                        const fullText=(container.innerText||'').replace(/\u00a0/g,' ').replace(/\xa0/g,' ');
+                        // ✅ FIX: views — cek semua varian bahasa Indonesia/Inggris
+                        const vmPatterns=[
+                            /([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio)?)\s*(?:tayangan|views|ditonton|viewed)/i,
+                            /(?:tayangan|views|ditonton)\s*[:\-·]?\s*([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio)?)/i,
+                        ];
+                        for(const vp of vmPatterns){const vm=fullText.match(vp);if(vm){views=parseNum(vm[1]||vm[0]);if(views>0)break;}}
+
+                        // ✅ FIX: tambah selector broader untuk like/comment di video FB
+                        // Di video search, engagement ada di aria-label dari link artikel, bukan [role=button]
+                        const allEls=container.querySelectorAll('[aria-label],[role="button"],a[href]');
+                        allEls.forEach(el=>{
+                            const aria=(el.getAttribute('aria-label')||'').replace(/\xa0/g,' ').replace(/\u00a0/g,' ');
+                            let tx=(el.innerText||'').replace(/\xa0/g,' ').replace(/\u00a0/g,' ').trim();
+                            // Likes: "N Suka" / "N Like" / "Suka: N"
+                            if(/suka|like|reaksi|react/i.test(aria)&&/\d/.test(aria)){
+                                const nm=aria.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio)?)/i);
+                                if(nm)likes=Math.max(likes,parseNum(nm[1]));
+                            }
+                            // Comments
+                            if(/komentar|comment/i.test(aria)&&/\d/.test(aria)){
+                                const nm=aria.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio)?)/i);
+                                if(nm)comms=Math.max(comms,parseNum(nm[1]));
+                            }
                         });
-                        container.querySelectorAll('[aria-label*="komentar"],[aria-label*="comment"]').forEach(el=>{
-                            let tx=(el.innerText||'').trim();
+                        // ✅ FIX: fallback parse dari fullText untuk likes/comments/views video
+                        if(!likes){
+                            const lm=fullText.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio)?)\s*(?:suka|like|likes)\b/i)
+                                    ||fullText.match(/(?:suka|like|likes)\s*[·:\-]?\s*([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio)?)/i);
+                            if(lm)likes=parseNum(lm[1]||lm[0]);
+                        }
+                        if(!comms){
+                            const cm=fullText.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio)?)\s*(?:komentar|comment)\b/i)
+                                    ||fullText.match(/(?:komentar|comment)\s*[·:\-]?\s*([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio)?)/i);
+                            if(cm)comms=parseNum(cm[1]||cm[0]);
+                        }
+                        if(!views){
+                            const vm2=fullText.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio)?)\s*(?:tayangan|views|ditonton)\b/i);
+                            if(vm2)views=parseNum(vm2[1]||vm2[0]);
+                        }
+                        // Shares
+                        let shares=0;
+                        container.querySelectorAll('[aria-label*="bagikan"],[aria-label*="share"],[aria-label*="Share"],[aria-label*="Bagikan"]').forEach(el=>{
+                            let tx=(el.innerText||'').replace(/\xa0/g,' ').trim();
                             const childSpan=el.querySelector('span[dir="auto"]');
-                            if(childSpan)tx=(childSpan.innerText||'').trim();
-                            comms=Math.max(comms,parseNum(tx+' '+(el.getAttribute('aria-label')||'')));
+                            if(childSpan)tx=(childSpan.innerText||'').replace(/\xa0/g,' ').trim();
+                            const num=parseNum(tx+' '+(el.getAttribute('aria-label')||''));
+                            if(num>0)shares=Math.max(shares,num);
                         });
+                        if(!shares){
+                            const sm=fullText.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio)?)\s*(?:kali\s+dibagikan|x\s+dibagikan|dibagikan|shares?)/i);
+                            if(sm)shares=parseNum(sm[0]);
+                        }
                         images=extractImages(container);
                     }
                     s.add(url);
                     r.push({url,author:author||'Unknown',text:txt.slice(0,1000),caption:txt.slice(0,1000),
                         timestamp:'',type:detected||st,likes_count:likes||0,comments_count:comms||0,
-                        views_count:views||0,shares_count:0,images,media_urls:images,media_count:images.length,
-                        engagement_score:likes+comms*2+views,source:'generic'});
+                        views_count:views||0,shares_count:shares||0,images,media_urls:images,media_count:images.length,
+                        engagement_score:likes+comms*2+views,source:'generic',matched_via:kw ? `search:${kw}` : ''});
                 }catch(e){}
             });
             return r;
@@ -923,17 +1253,274 @@ class FacebookKeywordMonitor:
             n=0
             for item in batch:
                 u=item.get('url','')
-                if not u or u in seen_urls or not _is_valid_result_url(u): continue
-                if keyword and not _keyword_in_item(item, keyword):
+                key = _fb_content_key(u) or u
+                if not u or key in seen_urls or not _is_valid_result_url(u): continue
+                if keyword and search_type != "videos" and not _keyword_in_item(item, keyword):
                     continue
-                seen_urls.add(u); results.append(item); n+=1
+                seen_urls.add(key); results.append(item); n+=1
             if rnd%5==0 or n>0: print(Fore.CYAN+f"   [GENERIC] R{rnd+1}: {len(results)}(+{n}) type={search_type}")
+            if rnd == 0 and n == 0 and search_type == "videos":
+                try:
+                    diag = page.evaluate("""() => ({
+                        links: document.querySelectorAll('a[href]').length,
+                        reels: [...document.querySelectorAll('a[href]')].filter(a => /\\/reels?\\//.test(a.getAttribute('href') || '')).length,
+                        videos: [...document.querySelectorAll('a[href]')].filter(a => /\\/videos?\\//.test(a.getAttribute('href') || '')).length,
+                        watch: [...document.querySelectorAll('a[href]')].filter(a => /\\/watch/.test(a.getAttribute('href') || '')).length,
+                        articles: document.querySelectorAll('[role="article"], [aria-posinset]').length
+                    })""")
+                    print(Fore.YELLOW+f"   [GENERIC-DOM] links={diag.get('links')} reels={diag.get('reels')} videos={diag.get('videos')} watch={diag.get('watch')} articles={diag.get('articles')}")
+                except Exception:
+                    pass
             if n==0: stable+=1
             else: stable=0
             if stable>=ms: break
             page.evaluate(f"window.scrollBy(0,{random.choice([1000,1500,2000])})")
             time.sleep(random.uniform(0.8,1.5))
         return results[:max_items]
+
+    def _needs_detail_enrich(self, item: dict) -> bool:
+        url = item.get("url", "")
+        if not _is_commentable_url(url):
+            return False
+        text_missing = not (item.get("caption") or item.get("text") or "").strip()
+        core_missing = (
+            item.get("likes_count", 0) == 0
+            or item.get("comments_count", 0) == 0
+            or item.get("shares_count", 0) == 0
+        )
+        is_video = (item.get("type", "").lower() in ("videos", "video", "reel", "reels")
+                    or any(x in url.lower() for x in ("/watch", "/reel/", "/reels/", "/videos/", "/share/v/")))
+        return text_missing or (is_video and core_missing) or (
+            item.get("likes_count", 0) == 0
+            and item.get("comments_count", 0) == 0
+            and item.get("shares_count", 0) == 0
+        )
+
+    def _extract_detail_metadata(self, page: Page) -> dict:
+        try:
+            return page.evaluate(r"""
+            () => {
+                const out = {likes_count: 0, comments_count: 0, shares_count: 0, views_count: 0, caption: '', author: ''};
+                const clean = (text) => (text || '').replace(/\u00a0|\xa0|Â|�/g, ' ').replace(/\s+/g, ' ').trim();
+                const parseNum = (text) => {
+                    const m = clean(text).toLowerCase().match(/([\d]+(?:[.,][\d]+)?)(?:\s*(ribu|juta|mio|mn|rb|jt|k|m)(?![a-z]))?/i);
+                    if (!m) return 0;
+                    let n = parseFloat(m[1].replace(/\./g, '').replace(',', '.'));
+                    if (Number.isNaN(n)) return 0;
+                    const sf = (m[2] || '').toLowerCase();
+                    if (sf === 'k' || sf === 'rb' || sf === 'ribu') n *= 1000;
+                    else if (sf === 'm' || sf === 'jt' || sf === 'juta' || sf === 'mio' || sf === 'mn') n *= 1000000;
+                    return Math.floor(n) || 0;
+                };
+                const parseNums = (text) => {
+                    const matches = [...clean(text).toLowerCase().matchAll(/([\d]+(?:[.,][\d]+)?)(?:\s*(ribu|juta|mio|mn|rb|jt|k|m)(?![a-z]))?/gi)];
+                    return matches
+                        .map(m => parseNum(`${m[1]} ${m[2] || ''}`))
+                        .filter(n => n > 0);
+                };
+                const maxMetric = (current, text) => Math.max(current || 0, parseNum(text));
+                const bodyText = clean(document.body.innerText || '');
+                const metricNumber = /^(\d+(?:[.,]\d+)?\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?|\d+)$/i;
+                const scopedText = () => {
+                    const scopes = [
+                        ...document.querySelectorAll('[role="article"]'),
+                        document.querySelector('[role="main"]'),
+                    ].filter(Boolean);
+                    const text = scopes.map(el => clean(el.innerText || '')).filter(Boolean).join('\n');
+                    return text || bodyText;
+                };
+                const scanMetric = (patterns) => {
+                    const text = scopedText();
+                    for (const pat of patterns) {
+                        const m = text.match(pat);
+                        if (m) {
+                            const n = parseNum(m[1] || m[0]);
+                            if (n > 0) return n;
+                        }
+                    }
+                    return 0;
+                };
+
+                document.querySelectorAll('[aria-label]').forEach(el => {
+                    const aria = clean(el.getAttribute('aria-label') || '');
+                    const text = clean(el.innerText || '');
+                    const combined = `${aria} ${text}`;
+                    if (/suka|like|reaction|reaksi/i.test(combined)) out.likes_count = maxMetric(out.likes_count, combined);
+                    if (/komentar|comment/i.test(combined)) out.comments_count = maxMetric(out.comments_count, combined);
+                    if (/bagikan|share|kirim/i.test(combined)) out.shares_count = maxMetric(out.shares_count, combined);
+                    if (/tayangan|views|ditonton|viewed/i.test(combined)) out.views_count = maxMetric(out.views_count, combined);
+                });
+
+                const inferVideoViewsFromEngagementRow = () => {
+                    const lines = scopedText().split(/\n+/).map(clean).filter(Boolean);
+                    const actionIdx = lines.findIndex(line => /^(suka|like)$/i.test(line));
+                    if (actionIdx <= 0) return 0;
+                    const nums = [];
+                    for (let i = Math.max(0, actionIdx - 10); i < actionIdx; i++) {
+                        const line = lines[i];
+                        if (metricNumber.test(line) && !/^\d{1,2}:\d{2}(?::\d{2})?$/.test(line)) {
+                            nums.push(line);
+                        }
+                    }
+                    if (nums.length >= 3) return parseNum(nums[nums.length - 1]);
+                    if (nums.length >= 2 && /(rb|ribu|k|jt|juta|mio|mn)\b/i.test(nums[nums.length - 1])) {
+                        return parseNum(nums[nums.length - 1]);
+                    }
+                    return 0;
+                };
+                const inferVideoEngagementRow = () => {
+                    const text = scopedText();
+                    const actionMatch = text.match(/([\s\S]{0,500}?)(?:\bSuka\b|\bLike\b)\s+(?:Komentari|Comment)\s+(?:Bagikan|Share)\b/i);
+                    if (!actionMatch) return;
+                    const nums = parseNums(actionMatch[1]).filter(n => n < 1000000000);
+                    if (nums.length < 2) return;
+                    const isVideo = /\/(?:videos?|watch|reels?|reel)\b/i.test(location.pathname + location.search);
+                    if (isVideo && nums.length >= 3) {
+                        const [likes, comments, views] = nums.slice(-3);
+                        out.likes_count = Math.max(out.likes_count, likes);
+                        out.comments_count = Math.max(out.comments_count, comments);
+                        out.views_count = Math.max(out.views_count, views);
+                    } else if (nums.length >= 3) {
+                        const [likes, comments, shares] = nums.slice(-3);
+                        out.likes_count = Math.max(out.likes_count, likes);
+                        out.comments_count = Math.max(out.comments_count, comments);
+                        out.shares_count = Math.max(out.shares_count, shares);
+                    } else {
+                        const [likes, comments] = nums.slice(-2);
+                        out.likes_count = Math.max(out.likes_count, likes);
+                        out.comments_count = Math.max(out.comments_count, comments);
+                    }
+                };
+
+                out.likes_count = out.likes_count || scanMetric([
+                    /([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:suka|likes?|reaksi|reactions?)/i,
+                    /(?:suka|likes?|reaksi|reactions?)\s*[:\-]?\s*([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)/i,
+                ]);
+                out.comments_count = out.comments_count || scanMetric([
+                    /([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:komentar|comments?)/i,
+                    /(?:komentar|comments?)\s*[:\-]?\s*([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)/i,
+                ]);
+                out.shares_count = out.shares_count || scanMetric([
+                    /([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:kali\s+dibagikan|x\s+dibagikan|dibagikan|shares?)/i,
+                    /(?:dibagikan|shares?)\s*[:\-]?\s*([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)/i,
+                ]);
+                out.views_count = out.views_count || scanMetric([
+                    /([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:tayangan|views?|ditonton|viewed)/i,
+                    /(?:tayangan|views?|ditonton|viewed)\s*[:\-]?\s*([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)/i,
+                ]);
+                inferVideoEngagementRow();
+                out.views_count = Math.max(inferVideoViewsFromEngagementRow(), out.views_count);
+
+                const chrome = /(notifikasi|belum dibaca|lihat semua|orang yang anda kenal|saran teman|selamat datang|welcome to facebook|masuk ke facebook|log in to facebook|filter|hasil pencarian|tanggal diposting|marketplace|halaman|grup|acara)/i;
+                const metricish = /^([\d.,]+\s*(rb|ribu|k|jt|juta|m|mio|mn)?|[\d:]+|suka|komentar|bagikan|share|like|comment)$/i;
+                const okCaption = (t) => t && t.length >= 8 && t.length < 2200 && !chrome.test(t) && !metricish.test(t);
+
+                const og = clean(document.querySelector('meta[property="og:description"],meta[name="description"]')?.getAttribute('content') || '');
+                if (okCaption(og)) out.caption = og;
+
+                if (!out.caption) {
+                    const selectors = ['[data-ad-preview="message"]', '[data-ad-comet-preview="message"]', '[data-testid="post_message"]'];
+                    for (const sel of selectors) {
+                        const text = clean(document.querySelector(sel)?.textContent || '');
+                        if (okCaption(text)) { out.caption = text; break; }
+                    }
+                }
+
+                if (!out.caption) {
+                    let best = '';
+                    document.querySelectorAll('[role="article"], [role="main"], [role="complementary"]').forEach(scope => {
+                        const lines = (scope.innerText || '').split(/\n+/).map(clean).filter(Boolean);
+                        for (const line of lines) {
+                            if (!okCaption(line)) continue;
+                            if (/durasi video|diverifikasi|yang lalu|\btayangan\b/i.test(line)) continue;
+                            if (line.length > best.length) best = line;
+                        }
+                    });
+                    out.caption = best;
+                }
+
+                const authorEl = document.querySelector('h1 a[role="link"], h2 a[role="link"], h3 a[role="link"], strong[dir="auto"], a[role="link"] strong');
+                out.author = clean(authorEl?.innerText || '');
+                return out;
+            }
+            """)
+        except Exception as e:
+            print(Fore.YELLOW+f"     [DETAIL] metadata extract error: {e}")
+            return {}
+
+    def enrich_missing_details(self, posts, limit=None, progress_callback=None):
+        if not posts:
+            return posts
+        try:
+            limit = int(limit if limit is not None else FB_DETAIL_ENRICH_LIMIT)
+        except Exception:
+            limit = FB_DETAIL_ENRICH_LIMIT
+        if limit <= 0:
+            return posts
+
+        def _detail_priority(item: dict):
+            url = (item.get("url") or "").lower()
+            is_video = item.get("type", "").lower() in ("videos", "video", "reel", "reels") or any(
+                x in url for x in ("/watch", "/reel/", "/reels/", "/videos/", "/share/v/")
+            )
+            incomplete = int(item.get("shares_count", 0) or 0) == 0 or int(item.get("views_count", 0) or 0) == 0
+            return (1 if is_video else 0, 1 if incomplete else 0, _engagement_score(item))
+
+        targets = [p for p in posts if self._needs_detail_enrich(p)]
+        if not targets:
+            return posts
+        self.initialize_browser()
+        targets.sort(key=_detail_priority, reverse=True)
+        targets = targets[:limit]
+        tab = self._new_page()
+        try:
+            for idx, post in enumerate(targets, 1):
+                url = post.get("url", "")
+                if progress_callback:
+                    progress_callback(f"Detail metadata {idx}/{len(targets)}")
+                try:
+                    print(Fore.CYAN+f"     [DETAIL] {idx}/{len(targets)} {url[:70]}...")
+                    tab.goto(url, wait_until="domcontentloaded", timeout=18000)
+                    time.sleep(random.uniform(FB_DETAIL_WAIT_SECONDS, FB_DETAIL_WAIT_SECONDS + 0.6))
+                    self._close_popups(tab)
+                    try:
+                        tab.evaluate("window.scrollBy(0, 500)")
+                        time.sleep(0.4)
+                    except Exception:
+                        pass
+                    meta = self._extract_detail_metadata(tab)
+                    for src_key, dst_key in [
+                        ("likes_count", "likes_count"),
+                        ("comments_count", "comments_count"),
+                        ("shares_count", "shares_count"),
+                        ("views_count", "views_count"),
+                    ]:
+                        val = int(meta.get(src_key, 0) or 0)
+                        if dst_key == "views_count" and val > 0:
+                            # Detail/permalink view count is more trustworthy than search-card text.
+                            post[dst_key] = val
+                        elif val > int(post.get(dst_key, 0) or 0):
+                            post[dst_key] = val
+                    caption = (meta.get("caption") or "").strip()
+                    current = (post.get("caption") or post.get("text") or "").strip()
+                    if caption and (not current or len(caption) > len(current)):
+                        post["caption"] = caption[:1000]
+                        post["text"] = caption[:1000]
+                    author = (meta.get("author") or "").strip()
+                    current_author = str(post.get("author") or "")
+                    if author and (current_author in ("", "Unknown") or re.match(r"^\d{1,2}:\d{2}(?::\d{2})?$", current_author)):
+                        post["author"] = author[:100]
+                    post["engagement_score"] = _engagement_score(post)
+                    post["detail_enriched"] = True
+                except Exception as e:
+                    print(Fore.YELLOW+f"     [DETAIL] skip: {e}")
+                    post["detail_enrich_failed"] = True
+        finally:
+            try:
+                tab.close()
+            except Exception:
+                pass
+        return posts
 
     # ======================================================================
     #  GROUPS: extract group info (name + about) from search results
@@ -1090,6 +1677,9 @@ class FacebookKeywordMonitor:
         results=[]; seen_urls=set()
 
         print(Fore.CYAN+f"   [PAGES] Mengumpulkan daftar halaman untuk '{keyword}'...")
+        if FB_PAGE_DEEP_OPEN_LIMIT <= 0:
+            print(Fore.YELLOW+"   [PAGES] Deep-open halaman dinonaktifkan (FB_PAGE_DEEP_OPEN_LIMIT=0) untuk mode cepat")
+            return []
         page_urls = []
         _JS_PAGES = r"""
         () => {
@@ -1116,6 +1706,8 @@ class FacebookKeywordMonitor:
             page.evaluate("window.scrollBy(0,1500)")
             time.sleep(1)
 
+        if FB_PAGE_DEEP_OPEN_LIMIT > 0:
+            page_urls = page_urls[:FB_PAGE_DEEP_OPEN_LIMIT]
         print(Fore.CYAN+f"   [PAGES] Ditemukan {len(page_urls)} halaman, buka tiap halaman...")
 
         _JS_PAGE_FEED = r"""
@@ -1171,7 +1763,7 @@ class FacebookKeywordMonitor:
                         if(t.length>txt.length&&t.length<3000&&t!==author)txt=t;
                     });
                     if(kw&&!kwMatch(txt)&&!kwMatch(author))return;
-                    let likes=0,comms=0,views=0;
+                    let likes=0,comms=0,views=0,shares=0;
                     const fullText=(c.innerText||'').replace(/\u00a0/g,' ');
                     const vm=fullText.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio)?)\s*(?:tayangan|views|ditonton)/i);
                     if(vm)views=parseNum(vm[0]);
@@ -1184,12 +1776,20 @@ class FacebookKeywordMonitor:
                         if(aria.includes('komentar')||aria.includes('comment')){
                             comms=Math.max(comms,parseNum(tx+' '+aria));
                         }
+                        if(aria.includes('bagikan')||aria.includes('share')){
+                            const num=parseNum(tx+' '+aria);
+                            if(num>0)shares=Math.max(shares,num);
+                        }
                     });
+                    if(!shares){
+                        const sm=fullText.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio)?)\s*(?:kali\s+dibagikan|dibagikan|shares?)/i);
+                        if(sm)shares=parseNum(sm[0]);
+                    }
                     const images=extractImages(c);
                     s.add(url);
                     r.push({url,author:author||'Unknown',text:txt.slice(0,1000),caption:txt.slice(0,1000),
                         timestamp:'',type:'pages',likes_count:likes||0,comments_count:comms||0,
-                        views_count:views||0,shares_count:0,images,media_urls:images,media_count:images.length,
+                        views_count:views||0,shares_count:shares||0,images,media_urls:images,media_count:images.length,
                         engagement_score:likes+comms*2+views,source:'page_feed'});
                 }catch(e){}
             });
@@ -1213,10 +1813,11 @@ class FacebookKeywordMonitor:
                 n = 0
                 for item in batch:
                     u = item.get('url','')
-                    if u and u not in seen_urls and _is_valid_result_url(u):
+                    key = _fb_content_key(u) or u
+                    if u and key not in seen_urls and _is_valid_result_url(u):
                         if keyword and not _keyword_in_item(item, keyword):
                             continue
-                        seen_urls.add(u); results.append(item); n+=1
+                        seen_urls.add(key); results.append(item); n+=1
                 print(Fore.CYAN+f"   [PAGES] +{n} posts dari {p_url} (total: {len(results)})")
             except Exception as e:
                 print(Fore.YELLOW+f"   [PAGES] Skip {p_url}: {e}")
@@ -1239,28 +1840,42 @@ class FacebookKeywordMonitor:
         all_results=[]; seen_urls=set()
         print(Fore.YELLOW+f"\n[NAV] {url[:80]}")
         try:
+            # ✅ FIX: Setup GQL interceptor SEBELUM goto agar tidak miss responses
             gql_sid, gql_data, gql_urls = self._setup_gql(p)
-            p.goto(url,wait_until="domcontentloaded",timeout=30000); time.sleep(4); self._close_popups(p)
+            p.goto(url,wait_until="domcontentloaded",timeout=30000)
+            # ✅ FIX: Tambah wait lebih lama agar GQL sempat di-intercept
+            time.sleep(FB_SEARCH_LOAD_SECONDS)
+            self._close_popups(p)
+            # ✅ FIX: Scroll beberapa kali untuk trigger lazy load GQL
+            for _ in range(max(0, FB_SEARCH_PRE_SCROLLS)):
+                p.evaluate("window.scrollBy(0, 800)")
+                time.sleep(FB_SEARCH_SCROLL_DELAY)
+            time.sleep(min(0.3, FB_SEARCH_SCROLL_DELAY))
             if search_type == "posts":
                 for item in self._extract_feed(p,max_results,keyword):
                     u=item.get('url','')
-                    if u and u not in seen_urls and _is_valid_result_url(u): seen_urls.add(u); all_results.append(item)
+                    key=_fb_content_key(u) or u
+                    if u and key not in seen_urls and _is_valid_result_url(u): seen_urls.add(key); all_results.append(item)
             else:
                 for item in self._extract_generic(p,max_results,search_type,keyword):
                     u=item.get('url','')
-                    if u and u not in seen_urls and _is_valid_result_url(u): seen_urls.add(u); all_results.append(item)
-            if not all_results:
+                    key=_fb_content_key(u) or u
+                    if u and key not in seen_urls and _is_valid_result_url(u): seen_urls.add(key); all_results.append(item)
+            # ✅ FIX: Coba GQL bahkan jika DOM extraction sudah berhasil (tambah lebih banyak)
+            if len(all_results) < max_results:
                 print(Fore.YELLOW+f"   [GQL-FALLBACK] Trying GraphQL ({len(gql_data)} responses)...")
                 for item in self._extract_gql(gql_data,keyword,strict_keyword):
                     u=item.get('url','')
-                    if u and u not in seen_urls and _is_valid_result_url(u): seen_urls.add(u); all_results.append(item)
-                if all_results: print(Fore.GREEN+f"   [OK] GQL: {len(all_results)} items")
+                    key=_fb_content_key(u) or u
+                    if u and key not in seen_urls and _is_valid_result_url(u): seen_urls.add(key); all_results.append(item)
+                if gql_data: print(Fore.GREEN+f"   [GQL] +{len(all_results)} total after GQL")
             if not all_results:
                 print(Fore.YELLOW+"   [HTML-FALLBACK] Parsing embedded page JSON/HTML...")
                 for item in self._extract_embedded_html(p, max_results, "", search_type):
                     u=item.get('url','')
-                    if u and u not in seen_urls and _is_valid_result_url(u):
-                        seen_urls.add(u); all_results.append(item)
+                    key=_fb_content_key(u) or u
+                    if u and key not in seen_urls and _is_valid_result_url(u):
+                        seen_urls.add(key); all_results.append(item)
         except Exception as e: print(Fore.RED+f"   [FAIL] {e}")
         return all_results[:max_results]
 
@@ -1270,17 +1885,24 @@ class FacebookKeywordMonitor:
     def _parallel_scrape_types(self,keyword,types,max_results):
         all_results=[]; seen_urls=set()
         active_types=list(dict.fromkeys(types or ['posts']))
-        per_type=max(1, math.ceil(max_results/len(active_types)))
+        # ✅ FIX: per_type lebih besar agar total bisa mencapai max_results
+        # Bagi merata tapi minimal 200 per tipe agar ada cukup hasil
+        per_type=min(max_results, max(FB_PER_TYPE_MIN, math.ceil(max_results/len(active_types))))
         for i,st in enumerate(active_types):
-            if i>0: time.sleep(random.uniform(0.5,1.5))
+            if i>0: time.sleep(FB_TYPE_SWITCH_DELAY)
             print(Fore.CYAN+f"\n   [TAB] '{keyword}' type={st}...")
             tab=self._new_page()
             try:
-                url=f"https://www.facebook.com/search/{st}/?q={quote(keyword)}"
-                for item in self._scrape_search_url(url,keyword,min(200,per_type),st,page=tab):
-                    u=item.get('url','')
-                    if u and u not in seen_urls and _is_valid_result_url(u): seen_urls.add(u);item["deep_source_type"]=st;all_results.append(item)
-                print(Fore.GREEN+f"   [OK] {st}: {len(all_results)} items")
+                urls = [f"https://www.facebook.com/search/{st}/?q={quote(keyword)}"]
+                for surface_idx, url in enumerate(urls, 1):
+                    if len(all_results) >= max_results:
+                        break
+                    for item in self._scrape_search_url(url,keyword,per_type,st,page=tab):
+                        u=item.get('url','')
+                        key=_fb_content_key(u) or u
+                        if u and key not in seen_urls and _is_valid_result_url(u):
+                            seen_urls.add(key);item["deep_source_type"]="reels" if "/search/reels/" in url else st;all_results.append(item)
+                print(Fore.GREEN+f"   [OK] {st}: {len(all_results)} items total")
             except Exception as e: print(Fore.RED+f"   [FAIL] {st}: {e}")
             finally:
                 try: tab.close()
@@ -1290,7 +1912,7 @@ class FacebookKeywordMonitor:
     # ======================================================================
     #  COMMENT SCRAPING v5.3
     # ======================================================================
-    def _scrape_post_comments(self,post_url,max_comments=5,top_comments_count=5,page=None):
+    def _scrape_post_comments(self,post_url,max_comments=10,top_comments_count=10,page=None):
         result={"top_comments":[],"other_comments":[],"comments_scraped_count":0,"comments_scrape_failed":False}
         if max_comments<=0: return result
         if not _is_commentable_url(post_url):
@@ -1316,44 +1938,128 @@ class FacebookKeywordMonitor:
             (maxItems) => {
                 const r=[]; const st=new Set();
                 const parseNum=(text)=>{
-                    const m=(text||'').toLowerCase().replace(/\u00a0/g,' ').match(/([\d.,]+)\s*(rb|ribu|k|jt|juta|m|mio)?/i);
+                    if(!text)return 0;
+                    const raw=(text+'').toLowerCase().replace(/\u00a0/g,' ').trim();
+                    // Coba format "N,N rb" atau "N.N k" atau "N jt"
+                    const m=raw.match(/([\d]+(?:[.,][\d]+)?)\s*(rb|ribu|k|jt|juta|m|mio|mn)?/i);
                     if(!m)return 0;
-                    let n=parseFloat(m[1].replace(/\./g,'').replace(',','.'));
+                    let n=parseFloat(m[1].replace(',','.'));
+                    if(isNaN(n))return 0;
                     const sf=(m[2]||'').toLowerCase();
-                    if(sf==='k'||sf==='rb'||sf==='ribu')n*=1000;
-                    else if(sf==='m'||sf==='jt'||sf==='juta'||sf==='mio')n*=1000000;
-                    return Math.floor(n)||0;
+                    if(sf==='k'||sf==='rb'||sf==='ribu')n=Math.floor(n*1000);
+                    else if(sf==='m'||sf==='jt'||sf==='juta'||sf==='mio'||sf==='mn')n=Math.floor(n*1000000);
+                    else n=Math.floor(n);
+                    return n||0;
                 };
-                let cs=[...document.querySelectorAll('[aria-label^="Komentar oleh "],[aria-label^="Comment by "]')];
-                if(!cs.length)cs=[...document.querySelectorAll('div[data-testid="UFI2Comment/body"],div[data-testid="UFI2Comment"]')];
+
+                // Strategi 1: artikel komentar dengan aria-label lengkap (versi desktop/bahasa)
+                let cs=[
+                    ...document.querySelectorAll('[aria-label^="Komentar oleh "]'),
+                    ...document.querySelectorAll('[aria-label^="Comment by "]'),
+                ];
+                // Strategi 2: fallback ke div UFI (versi lama)
+                if(!cs.length){
+                    cs=[...document.querySelectorAll('div[data-testid="UFI2Comment/body"],div[data-testid="UFI2Comment"]')];
+                }
+                // Strategi 3: role="article" di dalam section komentar
+                if(!cs.length){
+                    const allArts=[...document.querySelectorAll('[role="article"]')];
+                    // Lewati artikel pertama (itu postingannya sendiri)
+                    cs=allArts.slice(1).filter(a=>{
+                        const al=(a.getAttribute('aria-label')||'').toLowerCase();
+                        return al.includes('komentar')||al.includes('comment')||al.includes('balasan')||al.includes('reply');
+                    });
+                    if(!cs.length&&allArts.length>1)cs=allArts.slice(1);
+                }
+
                 cs.forEach(c=>{try{
                     const aria=(c.getAttribute('aria-label')||'').trim();
-                    const am=aria.match(/^(?:Komentar oleh|Comment by)\s+(.+?)\s+(\d+\s*(?:detik|menit|jam|hari|minggu|bulan|tahun|second|minute|hour|day|week|month|year)s?(?:\s+(?:yang lalu|ago))?)/i);
-                    let au=am?am[1].trim():'Unknown';
-                    const timestamp=am?am[2].trim():'';
-                    if(au==='Unknown'){
-                        const linkEl=c.querySelector('a[role="link"] span[dir="auto"],strong[dir="auto"],a[role="link"]');
-                        if(linkEl)au=(linkEl.innerText||'').trim().slice(0,100)||'Unknown';
+                    const am=aria.match(/^(?:Komentar oleh|Comment by)\s+(.+?)(?:\s+(\d+\s*(?:detik|menit|jam|hari|minggu|bulan|tahun|second|minute|hour|day|week|month|year)s?(?:\s+(?:yang lalu|ago))?))?$/i);
+                    let au=am?am[1].trim():'';
+                    let timestamp=am&&am[2]?am[2].trim():'';
+
+                    // Fallback nama dari link/strong
+                    if(!au){
+                        const linkEl=c.querySelector('a[role="link"] span[dir="auto"]')||
+                                     c.querySelector('strong[dir="auto"]')||
+                                     c.querySelector('a[role="link"]');
+                        if(linkEl)au=(linkEl.innerText||'').trim().slice(0,100);
                     }
-                    const lines=(c.innerText||'').split(/\n+/).map(x=>x.trim()).filter(Boolean);
-                    const actionAt=lines.findIndex(x=>/^(suka|like|balas|reply)$/i.test(x));
-                    const timeAt=lines.findIndex(x=>/^\d+\s*(detik|menit|jam|hari|minggu|bulan|tahun|second|minute|hour|day|week|month|year)/i.test(x));
-                    const end=[actionAt,timeAt].filter(x=>x>=0).reduce((a,b)=>Math.min(a,b),lines.length);
-                    const bodies=lines.slice(0,end).filter(x=>x!==au&&!/^(pembuat|author|top contributor)$/i.test(x));
-                    const t=bodies.sort((a,b)=>b.length-a.length)[0]||'';
-                    if(!t||st.has(t)||t.length<3)return;
-                    let likes=0;
-                    const reaction=c.querySelector('[aria-label^="Suka: "][aria-label*="orang"],[aria-label^="Like: "]');
-                    if(reaction)likes=parseNum(reaction.getAttribute('aria-label')||'');
-                    if(!likes&&actionAt>=0){
-                        for(const line of lines.slice(actionAt+1)){
-                            if(/^[\d.,]+\s*(rb|ribu|k|jt|juta|m|mio)?$/i.test(line)){likes=parseNum(line);break;}
-                            if(/^lihat|^view/i.test(line))break;
+                    if(!au)au='Unknown';
+
+                    // Ekstrak timestamp jika belum ada
+                    if(!timestamp){
+                        const tsEl=c.querySelector('a[href*="comment_id"],abbr[data-utime],a[aria-label*="jam"],a[aria-label*="menit"],a[aria-label*="detik"],a[aria-label*="hari"],a[aria-label*="minggu"]');
+                        if(tsEl){
+                            const tsLabel=tsEl.getAttribute('aria-label')||tsEl.innerText||'';
+                            const tsMatch=tsLabel.match(/\d+\s*(?:detik|menit|jam|hari|minggu|bulan|tahun|second|minute|hour|day|week|month|year)/i);
+                            if(tsMatch)timestamp=tsMatch[0].trim();
                         }
                     }
+
+                    // Ambil teks komentar — kecualikan: nama author, timestamp, tombol aksi
+                    const lines=(c.innerText||'').split(/\n+/).map(x=>x.trim()).filter(Boolean);
+                    const SKIP=/^(suka|like|balas|reply|lihat\s+balasan|view\s+replies?|lihat\s+lebih|see\s+more|pembuat|author|top\s+contributor|·|•|\d+[ws]|\d+\s*(detik|menit|jam|hari|minggu|bulan|tahun))$/i;
+                    const bodies=lines.filter(x=>x&&x!==au&&!SKIP.test(x)&&!/^\d+\s*(detik|menit|jam|hari|minggu|bulan|tahun|second|minute|hour|day|week|month|year)/i.test(x));
+                    // Pilih teks terpanjang sebagai isi komentar
+                    const t=bodies.sort((a,b)=>b.length-a.length)[0]||'';
+                    if(!t||st.has(t)||t.length<2)return;
+
+                    // ── Ekstrak likes komentar — multi-strategi ──
+                    let likes=0;
+
+                    // S1: aria-label "Suka: N orang" / "Like: N people"
+                    const reactionEl=c.querySelector(
+                        '[aria-label*="Suka:"][aria-label*="orang"],' +
+                        '[aria-label*="Like:"][aria-label*="people"],' +
+                        '[aria-label*="reactions"],' +
+                        '[aria-label*="reaksi"]'
+                    );
+                    if(reactionEl){
+                        const rLabel=reactionEl.getAttribute('aria-label')||'';
+                        const rMatch=rLabel.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m)?)/i);
+                        if(rMatch)likes=parseNum(rMatch[1]);
+                    }
+
+                    // S2: tombol suka komentar (span dengan angka di sebelah heart icon)
+                    if(!likes){
+                        c.querySelectorAll('[aria-label*="suka"],[aria-label*="Suka"],[aria-label*="like"],[aria-label*="Like"]').forEach(el=>{
+                            if(likes>0)return;
+                            // Ambil span angka di dekatnya
+                            const parent=el.parentElement||el;
+                            const spans=[...parent.querySelectorAll('span,div')];
+                            for(const sp of spans){
+                                const t2=(sp.innerText||'').trim();
+                                if(/^[\d.,]+\s*(rb|ribu|k|jt|juta|m)?$/i.test(t2)&&t2.length<10){
+                                    const n=parseNum(t2);
+                                    if(n>0){likes=n;break;}
+                                }
+                            }
+                        });
+                    }
+
+                    // S3: cari angka setelah tombol "Suka" di teks artikel
+                    if(!likes){
+                        const actionIdx=lines.findIndex(x=>/^(suka|like)$/i.test(x));
+                        if(actionIdx>=0){
+                            for(let i=actionIdx+1;i<Math.min(actionIdx+4,lines.length);i++){
+                                if(/^[\d.,]+\s*(rb|ribu|k|jt|juta|m)?$/i.test(lines[i])){
+                                    likes=parseNum(lines[i]);break;
+                                }
+                            }
+                        }
+                    }
+
                     st.add(t);
-                    r.push({comment_author:au,comment_text:t.slice(0,2000),comment_likes:likes,comment_timestamp:timestamp,is_reply:false});
-                }catch(e){}});return r;
+                    r.push({
+                        comment_author:au,
+                        comment_text:t.slice(0,2000),
+                        comment_likes:likes,
+                        comment_timestamp:timestamp,
+                        is_reply:false
+                    });
+                }catch(e){}});
+                return r;
             }
             """
             while len(all_c)<max_comments and time.time()<deadline and more<15:
@@ -1385,17 +2091,17 @@ class FacebookKeywordMonitor:
         except Exception as e:
             print(Fore.YELLOW+f"     [COMMENTS] Error: {e}"); result["comments_scrape_failed"]=True; return result
         all_c.sort(key=lambda c:c.get("comment_likes",0),reverse=True)
-        top_count=max(1, min(int(top_comments_count or 5), len(all_c) or 1))
+        top_count=max(1, min(int(top_comments_count or 10), len(all_c) or 1))
         result["top_comments"]=all_c[:top_count]; result["other_comments"]=all_c[top_count:]
         result["comments_scraped_count"]=len(all_c)
         if len(all_c)==0: result["comments_scrape_failed"]=True
-        print(Fore.GREEN+f"     [COMMENTS] Done: {len(all_c)} comments")
+        print(Fore.GREEN+f"     [COMMENTS] Done: {len(all_c)} comments, top {top_count} by likes")
         return result
 
     # ======================================================================
     #  PUBLIC APIs
     # ======================================================================
-    def enrich_comments(self, posts, max_comments_per_post=0, top_comments_count=5,
+    def enrich_comments(self, posts, max_comments_per_post=0, top_comments_count=10,
                         progress_callback=None):
         """Attach comments once to each final, unique, commentable result."""
         if max_comments_per_post <= 0 or not posts:
@@ -1425,12 +2131,18 @@ class FacebookKeywordMonitor:
 
     def scrape_keyword(self,raw_keyword,max_results=1000,types=None,sort_by="engagement",
                        min_likes=None,min_comments=None,min_views=None,
-                       max_comments_per_post=0,top_comments_count=5,progress_callback=None):
+                       max_comments_per_post=0,top_comments_count=10,progress_callback=None,
+                       detail_enrich_limit=None):
         if types is None: types=['posts']
         keyword=self._clean_keyword(raw_keyword)
         print(Fore.CYAN+f"\n[KEYWORD] {keyword} | Max:{max_results}")
         self.initialize_browser()
         all_results=self._parallel_scrape_types(keyword,types,max_results)
+        self.enrich_missing_details(
+            all_results,
+            limit=detail_enrich_limit,
+            progress_callback=progress_callback,
+        )
         if max_comments_per_post>0 and all_results:
             commentable=[p for p in all_results if _is_commentable_url(p.get('url',''))]
             posts_for_c=sorted(commentable,key=lambda p:_engagement_score(p),reverse=True)
@@ -1455,7 +2167,8 @@ class FacebookKeywordMonitor:
 
     def scrape_hashtag(self,hashtag,max_results=1000,sort_by="engagement",
                        min_likes=None,min_comments=None,min_views=None,
-                       max_comments_per_post=0,top_comments_count=5,progress_callback=None):
+                       max_comments_per_post=0,top_comments_count=10,progress_callback=None,
+                       detail_enrich_limit=None):
         tag=hashtag.lstrip('#').strip()
         print(Fore.CYAN+f"\n[HASHTAG] #{tag}")
         self.initialize_browser()
@@ -1471,6 +2184,11 @@ class FacebookKeywordMonitor:
                     item["matched_via"]="keyword_fallback"
                     if _is_valid_result_url(item.get("url","")) and item.get("url","") not in [x.get("url","") for x in all_results]: all_results.append(item)
             except: pass
+        self.enrich_missing_details(
+            all_results,
+            limit=detail_enrich_limit,
+            progress_callback=progress_callback,
+        )
         if max_comments_per_post>0 and all_results:
             commentable=[p for p in all_results if _is_commentable_url(p.get('url',''))]
             for idx,post in enumerate(commentable):
@@ -1494,7 +2212,8 @@ class FacebookKeywordMonitor:
 
     def scrape_trending(self,max_results=1000,sort_by="engagement",keyword="",
                        types=None,min_likes=None,min_comments=None,min_views=None,
-                       max_comments_per_post=0,top_comments_count=5,progress_callback=None):
+                       max_comments_per_post=0,top_comments_count=10,progress_callback=None,
+                       detail_enrich_limit=None):
         if types is None: types=['posts','videos','groups','pages']
         print(Fore.CYAN+f"\n[TRENDING] {keyword or '(semua)'}")
         self.initialize_browser()
@@ -1502,11 +2221,19 @@ class FacebookKeywordMonitor:
         all_results=[]; seen_urls=set()
         for skw in sks:
             if len(all_results)>=max_results: break
-            for item in self._parallel_scrape_types(skw,types,min(200,max_results-len(all_results))):
+            # ✅ FIX: beri cukup kuota per keyword, bukan dibatasi 200
+            remaining = max_results - len(all_results)
+            for item in self._parallel_scrape_types(skw, types, max(200, remaining)):
                 u=item.get('url','')
-                if u and u not in seen_urls and _is_valid_result_url(u): seen_urls.add(u);item["engagement_score"]=_engagement_score(item);all_results.append(item)
+                key=_fb_content_key(u) or u
+                if u and key not in seen_urls and _is_valid_result_url(u): seen_urls.add(key);item["engagement_score"]=_engagement_score(item);all_results.append(item)
         for item in all_results:
             item["engagement_score"]=_engagement_score(item)
+        self.enrich_missing_details(
+            all_results,
+            limit=detail_enrich_limit,
+            progress_callback=progress_callback,
+        )
         if max_comments_per_post>0 and all_results:
             commentable=[p for p in all_results if _is_commentable_url(p.get('url',''))]
             for idx,post in enumerate(commentable):

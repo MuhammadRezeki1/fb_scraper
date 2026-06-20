@@ -14,9 +14,11 @@ import GlassCard from "@/components/ui/GlassCard";
 import LoadingSpinner from "@/components/ui/LoadingSpinner";
 import StatusBadge from "@/components/ui/StatusBadge";
 import DownloadButton from "@/components/ui/DownloadButton";
-import { api, PostResult, Comment } from "@/lib/api";
+import { api, PostResult, Comment, Reactor, MostActiveUser } from "@/lib/api";
 import { useScrape } from "@/contexts/ScrapeContext";
 import { usePersistState } from "@/hooks/usePersistState";
+
+type CommentScrapeMode = "top-liked" | "custom" | "all";
 
 const SENTIMENT_COLORS: Record<string, string> = {
   "Positif":     "#1d7a47",
@@ -31,10 +33,26 @@ const SENTIMENT_COLORS: Record<string, string> = {
 const TXT_SECONDARY = { color: "#4a5070" };
 const TXT_MUTED    = { color: "#8890aa" };
 
-function fmtNum(n: number) {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
-  if (n >= 1_000)     return (n / 1_000).toFixed(1) + "K";
-  return String(n);
+function safeNum(value: unknown, fallback = 0) {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function pctValue(value: unknown) {
+  return Math.min(100, Math.max(0, safeNum(value)));
+}
+
+function fmtNum(n?: number | null) {
+  const value = safeNum(n);
+  if (value >= 1_000_000) return (value / 1_000_000).toFixed(1) + "M";
+  if (value >= 1_000)     return (value / 1_000).toFixed(1) + "K";
+  return String(value);
+}
+
+function filterLabel(value: string) {
+  if (value === "ALL") return "Semua komentar";
+  if (value === "TOP_LIKED") return "Top 10 Like Terbanyak";
+  return value;
 }
 
 interface CommentWithReplies extends Comment {
@@ -64,16 +82,29 @@ function groupComments(comments: Comment[]): CommentWithReplies[] {
 }
 
 export default function PostScraperPage() {
-  const { job, isRunning, start, finish, fail } = useScrape();
+  const { job, isRunning, start, finish, fail, pendingAutoFillUrl, setAutoFillUrl } = useScrape();
   const [urls, setUrls]               = useState<string[]>([""]);
+
+  // Auto-fill dari halaman lain
+  useEffect(() => {
+    if (!pendingAutoFillUrl) return;
+    const timer = window.setTimeout(() => {
+      setUrls([pendingAutoFillUrl]);
+      setAutoFillUrl(null);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [pendingAutoFillUrl, setAutoFillUrl]);
   const [maxComments, setMax]         = useState(200);
-  const [allComments, setAllComments] = useState(false);
+  const [commentMode, setCommentMode] = useState<CommentScrapeMode>("top-liked");
   const [includeReplies, setReplies]  = useState(true);
+  const [scrapeReactors, setScrapeReactors] = useState(false);
+  const [maxReactors, setMaxReactors] = useState(200);
   const [delay, setDelay]             = useState(30);
   const [expandedKeys, setExpKeys]    = useState<Set<string | number>>(new Set());
   const [filterCat, setFilter]        = useState<string>("ALL");
   const [formError, setFormError]     = useState<string | null>(null);
   const [page, setPage]               = useState(1);
+  const [visibleReactors, setVisibleReactors] = useState(120);
   const PAGE_SIZE = 50;
 
   const [cachedResult, setCachedResult] = usePersistState<PostResult | null>("post-result", null);
@@ -85,6 +116,8 @@ export default function PostScraperPage() {
   const otherRun  = isRunning && !isMyJob;
 
   const result = ctxResult ?? cachedResult;
+  const scrapeAllComments = commentMode === "all" || commentMode === "top-liked";
+  const requestedMaxComments = scrapeAllComments ? 1_000_000 : Math.max(10, safeNum(maxComments, 200));
 
   useEffect(() => {
     if (ctxResult) setCachedResult(ctxResult);
@@ -96,7 +129,12 @@ export default function PostScraperPage() {
   const setUrl    = (i: number, v: string) => setUrls(p => p.map((u, idx) => idx === i ? v : u));
 
   const toggleExpand = (key: string | number) => {
-    setExpKeys(prev => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n; });
+    setExpKeys(prev => {
+      const n = new Set(prev);
+      if (n.has(key)) n.delete(key);
+      else n.add(key);
+      return n;
+    });
   };
 
   const isPostUrl = (url: string) => {
@@ -115,6 +153,10 @@ export default function PostScraperPage() {
       setFormError(`URL bukan URL post spesifik: "${nonPost[0].slice(0, 60)}"\nGunakan URL post seperti: facebook.com/namahalaman/posts/123456`);
       return;
     }
+    if (isBatch && scrapeAllComments) {
+      setFormError("Mode Top 10/Semua komentar hanya tersedia untuk satu post agar proses tetap terkendali. Untuk batch, pilih mode Custom.");
+      return;
+    }
     setFormError(null);
     const label = valid.length > 1 ? `${valid.length} post (batch)` : valid[0];
     start("post", label);
@@ -127,9 +169,19 @@ export default function PostScraperPage() {
         setCachedResult(postResult);
         finish({ postResult, elapsed: Math.round((Date.now() - t0) / 1000) });
       } else {
-        const res = await api.scrape.post(valid[0], maxComments, includeReplies, allComments);
+        const res = await api.scrape.post(
+          valid[0],
+          requestedMaxComments,
+          includeReplies,
+          scrapeAllComments,
+          scrapeReactors,
+          maxReactors,
+        );
         const postResult = res.data ?? null;
         setCachedResult(postResult);
+        setFilter(commentMode === "top-liked" ? "TOP_LIKED" : "ALL");
+        setPage(1);
+        setVisibleReactors(120);
         finish({ postResult, elapsed: Math.round((Date.now() - t0) / 1000) });
       }
     } catch (e: unknown) {
@@ -137,13 +189,28 @@ export default function PostScraperPage() {
     }
   };
 
-  const categories = result ? ["ALL", ...new Set(result.comments.map((c: Comment) => c.category))] : ["ALL"];
+  const resultComments = result?.comments ?? [];
+  const allGroups = groupComments(resultComments);
+  const topLikedGroups = allGroups
+    .slice()
+    .sort((a, b) => safeNum(b.like_count) - safeNum(a.like_count))
+    .slice(0, 10);
+  const topLikedComments = topLikedGroups.flatMap(group => [group, ...group.replies]);
+  const categories = result
+    ? [
+        "ALL",
+        ...(topLikedComments.length > 0 ? ["TOP_LIKED"] : []),
+        ...new Set(resultComments.map((c: Comment) => c.category).filter(Boolean)),
+      ]
+    : ["ALL"];
   const handleFilterChange = (val: string) => { setFilter(val); setPage(1); };
 
   const flatFiltered: Comment[] = result
-    ? filterCat === "ALL" ? result.comments : result.comments.filter((c: Comment) => c.category === filterCat)
+    ? filterCat === "TOP_LIKED"
+      ? topLikedComments
+      : filterCat === "ALL" ? resultComments : resultComments.filter((c: Comment) => c.category === filterCat)
     : [];
-  const grouped = groupComments(flatFiltered);
+  const grouped = filterCat === "TOP_LIKED" ? topLikedGroups : groupComments(flatFiltered);
   const totalPages = Math.max(1, Math.ceil(grouped.length / PAGE_SIZE));
   const safePage   = Math.min(page, totalPages);
   const pageStart  = (safePage - 1) * PAGE_SIZE;
@@ -152,15 +219,17 @@ export default function PostScraperPage() {
 
   const pieData = result?.sentiment_summary
     ? [
-        { name: "Positif",     value: result.sentiment_summary.positive_count },
-        { name: "Negatif",     value: result.sentiment_summary.negative_count },
-        { name: "Netral",      value: result.sentiment_summary.neutral_count },
-        { name: "Hate Speech", value: result.sentiment_summary.hate_speech_count },
-        { name: "Toxic",       value: result.sentiment_summary.toxic_count },
-        { name: "Humor",       value: result.sentiment_summary.humor_count },
-        { name: "Sarkasme",    value: result.sentiment_summary.sarcasm_count },
+        { name: "Positif",     value: safeNum(result.sentiment_summary.positive_count) },
+        { name: "Negatif",     value: safeNum(result.sentiment_summary.negative_count) },
+        { name: "Netral",      value: safeNum(result.sentiment_summary.neutral_count) },
+        { name: "Hate Speech", value: safeNum(result.sentiment_summary.hate_speech_count) },
+        { name: "Toxic",       value: safeNum(result.sentiment_summary.toxic_count) },
+        { name: "Humor",       value: safeNum(result.sentiment_summary.humor_count) },
+        { name: "Sarkasme",    value: safeNum(result.sentiment_summary.sarcasm_count) },
       ].filter(d => d.value > 0)
     : [];
+  const reactors = result?.reactors ?? [];
+  const visibleReactorItems = reactors.slice(0, visibleReactors);
 
   const renderCommentRow = (c: Comment, isReply = false, rowIdx: number) => {
     const key = `${c.number}-${rowIdx}`;
@@ -184,8 +253,8 @@ export default function PostScraperPage() {
               style={isReply ? { borderLeft: "2px solid rgba(59,109,206,0.3)" } : undefined}>{c.text}</p>
           </td>
           <td><StatusBadge category={c.category} /></td>
-          <td className="text-sm">{c.like_count}</td>
-          <td className="text-sm" style={TXT_MUTED}>{((c.ml_confidence ?? 0) * 100).toFixed(0)}%</td>
+          <td className="text-sm">{fmtNum(c.like_count)}</td>
+          <td className="text-sm" style={TXT_MUTED}>{(safeNum(c.ml_confidence) * 100).toFixed(0)}%</td>
         </tr>
         {isExp && (
           <tr key={`exp-${key}`}>
@@ -274,13 +343,43 @@ export default function PostScraperPage() {
           <Plus size={14} />Tambah URL
         </button>
 
+        <div className="mb-4">
+          <label className="text-xs font-medium mb-2 block" style={TXT_MUTED}>Mode komentar</label>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+            {[
+              { value: "top-liked" as const, label: "Top 10 Like", desc: "Scrape semua dulu, tampilkan 10 komentar like terbanyak." },
+              { value: "custom" as const, label: "Custom", desc: "Ambil sesuai jumlah komentar yang Anda tentukan." },
+              { value: "all" as const, label: "Semua", desc: "Ambil seluruh komentar yang bisa dimuat dari DOM Facebook." },
+            ].map(opt => {
+              const active = commentMode === opt.value;
+              return (
+                <button
+                  key={opt.value}
+                  type="button"
+                  onClick={() => setCommentMode(opt.value)}
+                  disabled={isMyRun}
+                  className="text-left rounded-xl px-3 py-2.5 transition-all"
+                  style={{
+                    background: active ? "rgba(107,94,199,0.1)" : "rgba(0,0,0,0.03)",
+                    border: active ? "1px solid rgba(107,94,199,0.28)" : "1px solid rgba(0,0,0,0.08)",
+                    color: active ? "#6b5ec7" : TXT_SECONDARY.color,
+                  }}
+                >
+                  <span className="block text-sm font-semibold">{opt.label}</span>
+                  <span className="block text-xs mt-0.5" style={{ color: active ? "#6b5ec7" : TXT_MUTED.color }}>{opt.desc}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
           <div>
             <label className="text-xs font-medium mb-2 block" style={TXT_MUTED}>
-              Jumlah Komentar {allComments && <span style={{ color: "#6b5ec7" }}>(semua)</span>}
+              Jumlah Komentar {scrapeAllComments && <span style={{ color: "#6b5ec7" }}>(otomatis semua)</span>}
             </label>
             <input type="number" value={maxComments} onChange={e => setMax(Number(e.target.value))}
-              min={10} max={100000} disabled={isMyRun || allComments} className="glass-input w-full px-4 py-2.5 text-sm disabled:opacity-40" />
+              min={10} max={100000} disabled={isMyRun || scrapeAllComments} className="glass-input w-full px-4 py-2.5 text-sm disabled:opacity-40" />
           </div>
           {isBatch && (
             <div>
@@ -294,19 +393,29 @@ export default function PostScraperPage() {
         <div className="flex flex-wrap gap-3 mb-5">
           <label className="flex items-center gap-2 px-3 py-2 rounded-xl cursor-pointer text-sm"
             style={{ background: "rgba(0,0,0,0.03)", border: "1px solid rgba(0,0,0,0.08)", color: TXT_SECONDARY.color }}>
-            <input type="checkbox" checked={allComments} onChange={e => setAllComments(e.target.checked)}
-              disabled={isMyRun} className="w-4 h-4 accent-violet-600" />
-            Ambil semua komentar
-          </label>
-          <label className="flex items-center gap-2 px-3 py-2 rounded-xl cursor-pointer text-sm"
-            style={{ background: "rgba(0,0,0,0.03)", border: "1px solid rgba(0,0,0,0.08)", color: TXT_SECONDARY.color }}>
             <input type="checkbox" checked={includeReplies} onChange={e => setReplies(e.target.checked)}
               disabled={isMyRun} className="w-4 h-4 accent-violet-600" />
             Sertakan balasan
           </label>
+          <label className="flex items-center gap-2 px-3 py-2 rounded-xl cursor-pointer text-sm"
+            style={{ background: "rgba(0,0,0,0.03)", border: "1px solid rgba(0,0,0,0.08)", color: TXT_SECONDARY.color }}>
+            <input type="checkbox" checked={scrapeReactors} onChange={e => setScrapeReactors(e.target.checked)}
+              disabled={isMyRun} className="w-4 h-4 accent-violet-600" />
+            Scrape daftar penyuka
+          </label>
         </div>
 
-        {allComments && <p className="text-xs mb-4 -mt-1" style={{ color: "#9e6c0a" }}>⚠️ Mode "semua komentar" bisa memakan beberapa menit untuk post dengan ribuan komentar.</p>}
+        {scrapeReactors && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-5">
+            <div>
+              <label className="text-xs font-medium mb-2 block" style={TXT_MUTED}>Maks akun penyuka</label>
+              <input type="number" value={maxReactors} onChange={e => setMaxReactors(Math.min(5000, Math.max(10, safeNum(e.target.value, 200))))}
+                min={10} max={5000} disabled={isMyRun} className="glass-input w-full px-4 py-2.5 text-sm" />
+            </div>
+          </div>
+        )}
+
+        {scrapeAllComments && <p className="text-xs mb-4 -mt-1" style={{ color: "#9e6c0a" }}>Mode ini memuat komentar sebanyak mungkin dulu. Untuk post dengan ribuan komentar, proses bisa beberapa menit.</p>}
 
         <button onClick={handleScrape} disabled={isRunning || !urls.some(u => u.trim())}
           className="btn-primary flex items-center gap-2 px-6 py-2.5 text-sm">
@@ -346,13 +455,22 @@ export default function PostScraperPage() {
           <GlassCard glow="purple">
             <div className="flex items-start justify-between gap-4 flex-wrap">
               <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2 mb-1">
-                  <p className="text-xs" style={TXT_MUTED}>{result.scraped_at}</p>
-                  {result.post_type && result.post_type !== "post" && (
-                    <span className="badge" style={{ background: "rgba(107,94,199,0.1)", color: "#6b5ec7", border: "1px solid rgba(107,94,199,0.2)" }}>
-                      {result.post_type.toUpperCase()}
-                    </span>
-                  )}
+                <div className="flex items-center gap-3 mb-3">
+                  <div className="h-10 w-10 rounded-full flex items-center justify-center font-bold text-white shrink-0"
+                    style={{ background: "linear-gradient(135deg, #6b5ec7, #3b6dce)" }}>
+                    f
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold" style={{ color: "#1a1c23" }}>Facebook Post</p>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p className="text-xs" style={TXT_MUTED}>{result.scraped_at}</p>
+                      {result.post_type && result.post_type !== "post" && (
+                        <span className="badge" style={{ background: "rgba(107,94,199,0.1)", color: "#6b5ec7", border: "1px solid rgba(107,94,199,0.2)" }}>
+                          {result.post_type.toUpperCase()}
+                        </span>
+                      )}
+                    </div>
+                  </div>
                 </div>
                 <p className="font-medium text-sm leading-relaxed whitespace-pre-wrap wrap-break-word" style={{ color: "#1a1c23" }}>
                   {result.caption || "(tidak ada caption)"}
@@ -380,9 +498,9 @@ export default function PostScraperPage() {
               </div>
               <div className="flex gap-4 shrink-0">
                 {[
-                  { icon: ThumbsUp,      val: fmtNum(result.total_likes),   label: "Likes" },
+                  { icon: ThumbsUp,      val: fmtNum(result.total_likes),   label: "Like" },
                   { icon: MessageSquare, val: fmtNum(result.total_comments), label: "Komentar" },
-                  { icon: Share2,        val: fmtNum(result.total_shares),   label: "Shares" },
+                  { icon: Share2,        val: fmtNum(result.total_shares),   label: "Bagikan" },
                   { icon: Bookmark,      val: "—",                           label: "Saves" },
                 ].map(({ icon: Icon, val, label }) => (
                   <div key={label} className="text-center" title={label === "Saves" ? "Facebook tidak mengekspos jumlah save ke publik" : undefined}>
@@ -432,6 +550,68 @@ export default function PostScraperPage() {
             </div>
           </GlassCard>
 
+          {(reactors.length || result.reactors_scrape_failed) && (
+            <GlassCard>
+              <div className="flex items-center justify-between gap-3 flex-wrap mb-3">
+                <div>
+                  <h3 className="font-semibold flex items-center gap-2" style={{ color: "#1a1c23" }}>
+                    <ThumbsUp size={16} style={{ color: "#6b5ec7" }} />
+                    Penyuka Post ({result.reactors_count ?? reactors.length})
+                  </h3>
+                  {reactors.length > 0 && (
+                    <p className="text-xs mt-1" style={TXT_MUTED}>
+                      Menampilkan {visibleReactorItems.length} dari {reactors.length} akun yang berhasil dimuat dari dialog reaction.
+                    </p>
+                  )}
+                </div>
+                {reactors.length ? (
+                  <DownloadButton data={reactors} filename={`fb-post-${result.post_id || "unknown"}-reactors`}
+                    label="Download Semua Penyuka" className="px-2 py-1 text-xs" />
+                ) : null}
+              </div>
+              {reactors.length ? (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                  {visibleReactorItems.map((reactor: Reactor, idx: number) => (
+                    <a
+                      key={`${reactor.profile_url || reactor.name}-${idx}`}
+                      href={reactor.profile_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-center gap-2 rounded-xl px-3 py-2 transition-all hover:bg-black/5"
+                      style={{ border: "1px solid rgba(0,0,0,0.08)", color: "#1a1c23" }}
+                    >
+                      <span className="h-7 w-7 rounded-full flex items-center justify-center text-xs font-bold text-white"
+                        style={{ background: "#6b5ec7" }}>
+                        {(reactor.name || "?")[0].toUpperCase()}
+                      </span>
+                      <span className="text-sm truncate">{reactor.name}</span>
+                    </a>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-sm" style={TXT_MUTED}>
+                  Daftar penyuka tidak berhasil dimuat. Biasanya karena dialog reaction tidak tersedia, post dibatasi privasi, atau Facebook hanya menampilkan ringkasan reaction.
+                </p>
+              )}
+              {reactors.length > visibleReactorItems.length && (
+                <div className="flex justify-center gap-2 mt-4">
+                  <button
+                    onClick={() => setVisibleReactors(v => Math.min(reactors.length, v + 120))}
+                    className="btn-glass px-4 py-2 text-xs"
+                  >
+                    Tampilkan 120 lagi
+                  </button>
+                  <button
+                    onClick={() => setVisibleReactors(reactors.length)}
+                    className="btn-glass px-4 py-2 text-xs"
+                  >
+                    Tampilkan semua
+                  </button>
+                </div>
+              )}
+            </GlassCard>
+          )}
+
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <GlassCard>
               <h3 className="font-semibold mb-4 flex items-center gap-2" style={{ color: "#1a1c23" }}>
@@ -466,16 +646,19 @@ export default function PostScraperPage() {
                     { label: "Hate Speech", pct: result.sentiment_summary.hate_percentage,         color: "#c0394f" },
                     { label: "Toxic",       pct: result.sentiment_summary.toxic_percentage,        color: "#9e6c0a" },
                     { label: "Humor",       pct: result.sentiment_summary.humor_percentage ?? 0,   color: "#9e6c0a" },
-                  ].map(({ label, pct, color }) => (
-                    <div key={label}>
-                      <div className="flex justify-between text-xs mb-1" style={TXT_SECONDARY}>
-                        <span>{label}</span><span style={{ color }}>{pct.toFixed(1)}%</span>
+                  ].map(({ label, pct, color }) => {
+                    const value = pctValue(pct);
+                    return (
+                      <div key={label}>
+                        <div className="flex justify-between text-xs mb-1" style={TXT_SECONDARY}>
+                          <span>{label}</span><span style={{ color }}>{value.toFixed(1)}%</span>
+                        </div>
+                        <div className="progress-bar"><div className="progress-fill" style={{ width: `${value}%`, background: color }} /></div>
                       </div>
-                      <div className="progress-bar"><div className="progress-fill" style={{ width: `${Math.min(pct, 100)}%`, background: color }} /></div>
-                    </div>
-                  ))}
+                    );
+                  })}
                   <p className="text-xs pt-2" style={TXT_MUTED}>
-                    Avg ML confidence: {((result.sentiment_summary.avg_ml_confidence ?? 0) * 100).toFixed(1)}%
+                    Avg ML confidence: {(safeNum(result.sentiment_summary.avg_ml_confidence) * 100).toFixed(1)}%
                   </p>
                 </div>
               )}
@@ -487,12 +670,46 @@ export default function PostScraperPage() {
               <h3 className="font-semibold mb-3 flex items-center gap-2" style={{ color: "#1a1c23" }}>
                 <Smile size={16} style={{ color: "#2193b0" }} />Pengguna Paling Aktif
               </h3>
-              <div className="flex flex-wrap gap-2">
-                {result.sentiment_summary.most_active_users.slice(0, 10).map((u: { username: string; count: number }) => (
-                  <span key={u.username} className="px-3 py-1 rounded-full text-xs font-medium"
-                    style={{ background: "rgba(107,94,199,0.08)", border: "1px solid rgba(107,94,199,0.15)", color: "#6b5ec7" }}>
-                    @{u.username} ({u.count})
-                  </span>
+              <p className="text-xs mb-3" style={TXT_MUTED}>
+                Dihitung dari komentar utama + balasan yang berhasil discrape. Bukti di bawah menunjukkan contoh komentar dan apakah aktivitasnya berupa balasan ke pengguna lain.
+              </p>
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                {result.sentiment_summary.most_active_users.slice(0, 10).map((u: MostActiveUser) => (
+                  <div key={u.username} className="rounded-xl p-3 space-y-2"
+                    style={{ background: "rgba(107,94,199,0.04)", border: "1px solid rgba(107,94,199,0.12)" }}>
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="font-semibold text-sm" style={{ color: "#1a1c23" }}>@{u.username}</p>
+                        <p className="text-xs" style={TXT_MUTED}>
+                          {u.count} aktivitas: {safeNum(u.comments_count)} komentar utama, {safeNum(u.replies_count)} balasan
+                          {safeNum(u.total_likes) > 0 && ` · ${fmtNum(u.total_likes)} like di komentarnya`}
+                        </p>
+                      </div>
+                      <span className="px-2 py-1 rounded-full text-xs font-semibold"
+                        style={{ background: "rgba(107,94,199,0.1)", color: "#6b5ec7" }}>
+                        #{u.count}
+                      </span>
+                    </div>
+                    {u.reply_targets && u.reply_targets.length > 0 && (
+                      <p className="text-xs" style={{ color: "#3b6dce" }}>
+                        Sering membalas: {u.reply_targets.map(t => `@${t.username} (${t.count})`).join(", ")}
+                      </p>
+                    )}
+                    <div className="space-y-1.5">
+                      {(u.examples ?? []).map((ex, i) => (
+                        <div key={`${u.username}-${ex.number}-${i}`} className="rounded-lg px-3 py-2 text-xs"
+                          style={{ background: "rgba(255,255,255,0.65)", border: "1px solid rgba(0,0,0,0.06)" }}>
+                          <div className="flex flex-wrap gap-2 mb-1" style={TXT_MUTED}>
+                            <span>#{ex.number || "-"}</span>
+                            <span>{ex.is_reply ? `Balasan ke @${ex.reply_to || "unknown"}` : "Komentar utama"}</span>
+                            {safeNum(ex.like_count) > 0 && <span>{fmtNum(ex.like_count)} like</span>}
+                            {ex.category && <span>{ex.category}</span>}
+                          </div>
+                          <p className="line-clamp-2" style={{ color: "#1a1c23" }}>{ex.text}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
                 ))}
               </div>
             </GlassCard>
@@ -502,7 +719,7 @@ export default function PostScraperPage() {
             <div className="p-5 flex items-center justify-between flex-wrap gap-3">
               <h3 className="font-semibold flex items-center gap-2" style={{ color: "#1a1c23" }}>
                 <MessageSquare size={16} style={{ color: "#6b5ec7" }} />
-                Komentar ({flatFiltered.length})
+                {filterCat === "TOP_LIKED" ? "Top 10 Komentar Like Terbanyak" : `Komentar (${flatFiltered.length})`}
                 {flatFiltered.length !== grouped.length && (
                   <span className="text-xs font-normal" style={TXT_MUTED}>
                     · {grouped.filter(g => g.replies.length > 0).length} thread berbalasan
@@ -513,7 +730,7 @@ export default function PostScraperPage() {
                 <DownloadButton data={flatFiltered} filename={`fb-post-${result.post_id || "unknown"}-comments-filtered`}
                   label="Download CSV" className="px-2 py-1 text-xs" />
                 <select value={filterCat} onChange={e => handleFilterChange(e.target.value)} className="glass-input px-3 py-1.5 text-xs">
-                  {categories.map(c => <option key={c} value={c}>{c}</option>)}
+                  {categories.map(c => <option key={c} value={c}>{filterLabel(c)}</option>)}
                 </select>
               </div>
             </div>

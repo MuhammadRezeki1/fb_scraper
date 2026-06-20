@@ -4,8 +4,8 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   LayoutDashboard, FileText, User,
-  BarChart3, Shield, Activity, Globe,
-  FolderOpen, Zap, Search, Layers,
+  BarChart3, Shield, Activity,
+  FolderOpen, Zap, Layers,
 } from "lucide-react";
 
 const NAV_GROUPS = [
@@ -20,12 +20,6 @@ const NAV_GROUPS = [
     items: [
       { href: "/scrape/posts",    label: "Scrape Post",    icon: FileText },
       { href: "/scrape/profiles", label: "Scrape Profil",  icon: User },
-    ],
-  },
-  {
-    label: "Monitoring",
-    items: [
-      { href: "/monitor/keyword", label: "Keyword Monitoring", icon: Search },
     ],
   },
   {

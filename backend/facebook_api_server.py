@@ -471,10 +471,18 @@ sys.path.insert(0, os.environ["FB_SCRAPER_PATH"])
 url             = os.environ["FB_SCRAPE_URL"]
 max_comments    = int(os.environ.get("FB_MAX_COMMENTS", "200"))
 include_replies = os.environ.get("FB_INCLUDE_REPLIES", "1") == "1"
+scrape_reactors = os.environ.get("FB_SCRAPE_REACTORS", "0") == "1"
+max_reactors    = int(os.environ.get("FB_MAX_REACTORS", "200"))
 
 from fb_scraper_v21 import FacebookScraperV21
 with FacebookScraperV21() as scraper:
-    result = scraper.scrape_post(url, max_comments, include_replies=include_replies)
+    result = scraper.scrape_post(
+        url,
+        max_comments,
+        include_replies=include_replies,
+        scrape_reactors=scrape_reactors,
+        max_reactors=max_reactors,
+    )
     print(json.dumps(result, ensure_ascii=False, default=str))
 """
 
@@ -592,7 +600,8 @@ def _run_script_subprocess(script: str, env: dict, timeout: int = 300) -> dict:
             pass
 
 
-def run_post_scraper_subprocess(url: str, max_comments: int, include_replies: bool = True) -> dict:
+def run_post_scraper_subprocess(url: str, max_comments: int, include_replies: bool = True,
+                                scrape_reactors: bool = False, max_reactors: int = 200) -> dict:
     env = os.environ.copy()
     env["PYTHONIOENCODING"]   = "utf-8"
     env["PYTHONUTF8"]         = "1"
@@ -600,6 +609,8 @@ def run_post_scraper_subprocess(url: str, max_comments: int, include_replies: bo
     env["FB_SCRAPE_URL"]      = url
     env["FB_MAX_COMMENTS"]    = str(max_comments)
     env["FB_INCLUDE_REPLIES"] = "1" if include_replies else "0"
+    env["FB_SCRAPE_REACTORS"] = "1" if scrape_reactors else "0"
+    env["FB_MAX_REACTORS"]    = str(max_reactors)
 
     timeout = 3600 if max_comments >= 5000 else 900
     return _run_script_subprocess(_POST_SCRAPER_SCRIPT, env=env, timeout=timeout)
@@ -854,21 +865,25 @@ def scrape_single_post():
     url             = clean_fb_url(data.get("url", ""))
     max_comments    = int(data.get("max_comments", 200))
     include_replies = bool(data.get("include_replies", True))
+    scrape_reactors = bool(data.get("scrape_reactors", False))
+    max_reactors    = max(0, min(int(data.get("max_reactors", 200) or 200), 5000))
     if data.get("all_comments") or max_comments <= 0:
         max_comments = 1_000_000
 
     def work():
         print(Fore.CYAN + f"\n📝 Scraping Facebook post: {url[:70]}")
-        print(Fore.CYAN + f"   Max comments: {max_comments} | replies: {include_replies}")
+        print(Fore.CYAN + f"   Max comments: {max_comments} | replies: {include_replies} | reactors: {scrape_reactors} ({max_reactors})")
         print(Fore.YELLOW + "   ⏳ Estimasi ~60-300 detik...")
 
         t_start   = time.time()
-        result    = run_post_scraper_subprocess(url, max_comments, include_replies)
+        result    = run_post_scraper_subprocess(url, max_comments, include_replies, scrape_reactors, max_reactors)
         t_elapsed = time.time() - t_start
 
         result["_meta"] = {
             "elapsed_seconds":     round(t_elapsed, 2),
             "requested_max":       max_comments,
+            "scrape_reactors":     scrape_reactors,
+            "max_reactors":        max_reactors,
             "url_cleaned":         url,
             "comments_per_second": round(
                 result.get("comments_count", 0) / t_elapsed, 2
@@ -1423,7 +1438,7 @@ min_likes   = os.environ.get("FB_MIN_LIKES", "")
 min_comments= os.environ.get("FB_MIN_COMMENTS", "")
 min_views   = os.environ.get("FB_MIN_VIEWS", "")
 max_comments_per_post = int(os.environ.get("FB_MAX_COMMENTS_PER_POST", "0"))
-top_comments_count = int(os.environ.get("FB_TOP_COMMENTS_COUNT", "5"))
+top_comments_count = int(os.environ.get("FB_TOP_COMMENTS_COUNT", "10"))
 
 from fb_keyword_monitor import FacebookKeywordMonitor
 with FacebookKeywordMonitor() as monitor:
@@ -1448,7 +1463,7 @@ min_likes   = os.environ.get("FB_MIN_LIKES", "")
 min_comments= os.environ.get("FB_MIN_COMMENTS", "")
 min_views   = os.environ.get("FB_MIN_VIEWS", "")
 max_comments_per_post = int(os.environ.get("FB_MAX_COMMENTS_PER_POST", "0"))
-top_comments_count = int(os.environ.get("FB_TOP_COMMENTS_COUNT", "5"))
+top_comments_count = int(os.environ.get("FB_TOP_COMMENTS_COUNT", "10"))
 
 from fb_keyword_monitor import FacebookKeywordMonitor
 with FacebookKeywordMonitor() as monitor:
@@ -1476,7 +1491,7 @@ min_likes   = os.environ.get("FB_MIN_LIKES", "")
 min_comments= os.environ.get("FB_MIN_COMMENTS", "")
 min_views   = os.environ.get("FB_MIN_VIEWS", "")
 max_comments_per_post = int(os.environ.get("FB_MAX_COMMENTS_PER_POST", "0"))
-top_comments_count = int(os.environ.get("FB_TOP_COMMENTS_COUNT", "5"))
+top_comments_count = int(os.environ.get("FB_TOP_COMMENTS_COUNT", "10"))
 
 from fb_keyword_monitor import FacebookKeywordMonitor
 with FacebookKeywordMonitor() as monitor:
@@ -1501,7 +1516,7 @@ def run_keyword_monitor_subprocess(
     min_comments: Optional[int] = None,
     min_views: Optional[int] = None,
     max_comments_per_post: int = 0,
-    top_comments_count: int = 5,
+    top_comments_count: int = 10,
 ) -> dict:
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -1527,7 +1542,7 @@ def run_hashtag_scraper_subprocess(
     min_comments: Optional[int] = None,
     min_views: Optional[int] = None,
     max_comments_per_post: int = 0,
-    top_comments_count: int = 5,
+    top_comments_count: int = 10,
 ) -> dict:
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -1554,7 +1569,7 @@ def run_trending_scraper_subprocess(
     min_comments: Optional[int] = None,
     min_views: Optional[int] = None,
     max_comments_per_post: int = 0,
-    top_comments_count: int = 5,
+    top_comments_count: int = 10,
 ) -> dict:
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -1584,7 +1599,7 @@ def monitor_keyword():
     min_comments = data.get("min_comments")
     min_views = data.get("min_views")
     max_comments_per_post = int(data.get("max_comments_per_post", 0) or 0)
-    top_comments_count = int(data.get("top_comments_count", 5) or 5)
+    top_comments_count = int(data.get("top_comments_count", 10) or 10)
     if not isinstance(types, list):
         types = ["posts"]
 
@@ -1634,7 +1649,7 @@ def monitor_hashtag():
     min_comments = data.get("min_comments")
     min_views = data.get("min_views")
     max_comments_per_post = int(data.get("max_comments_per_post", 0) or 0)
-    top_comments_count = int(data.get("top_comments_count", 5) or 5)
+    top_comments_count = int(data.get("top_comments_count", 10) or 10)
 
     def work():
         print(Fore.CYAN + f"\n🏷️  [Job] Scraping hashtag: #{hashtag}")
@@ -1682,7 +1697,7 @@ def monitor_trending():
     min_comments = data.get("min_comments")
     min_views = data.get("min_views")
     max_comments_per_post = int(data.get("max_comments_per_post", 0) or 0)
-    top_comments_count = int(data.get("top_comments_count", 5) or 5)
+    top_comments_count = int(data.get("top_comments_count", 10) or 10)
     
     if not isinstance(types, list):
         types = ["posts", "videos", "groups", "pages"]
