@@ -43,7 +43,10 @@ const NAV_GROUPS = [
   },
 ];
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8003";
+const API_LABEL =
+  process.env.NEXT_PUBLIC_BACKEND_LABEL ??
+  process.env.NEXT_PUBLIC_API_BASE_PATH ??
+  "/api/v1";
 
 export default function Sidebar() {
   const pathname = usePathname();
@@ -115,7 +118,7 @@ export default function Sidebar() {
           <div className="min-w-0">
             <p className="text-xs font-semibold leading-tight" style={{ color: "#1a1c23" }}>Backend API</p>
             <p className="text-xs truncate" style={{ color: "#8890aa", fontFamily: "monospace" }}>
-              {API_URL.replace("http://", "")}
+              {API_LABEL}
             </p>
           </div>
           <div className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: "#1d7a47" }} />

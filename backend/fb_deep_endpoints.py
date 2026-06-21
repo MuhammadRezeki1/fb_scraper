@@ -50,12 +50,12 @@ def _extract_sort_filter(data: dict) -> dict:
     Validasi: sort_by harus salah satu dari nilai yang diizinkan.
     """
     result = {}
-    sort_by = data.get("sort_by", "engagement")
-    valid_sorts = {"engagement", "likes", "comments", "views", "shares", "recent"}
+    sort_by = data.get("sort_by", "trending")
+    valid_sorts = {"trending", "viral", "engagement", "likes", "comments", "views", "shares", "recent"}
     if sort_by in valid_sorts:
         result["sort_by"] = sort_by
     else:
-        result["sort_by"] = "engagement"  # fallback
+        result["sort_by"] = "trending"  # fallback
 
     for key in ("min_likes", "min_comments", "min_views"):
         val = data.get(key)
@@ -96,6 +96,36 @@ def _extract_sort_filter(data: dict) -> dict:
     fast_mode = data.get("fast_mode")
     if fast_mode is not None:
         result["fast_mode"] = bool(fast_mode) if isinstance(fast_mode, bool) else str(fast_mode).strip().lower() in {"1", "true", "yes", "on"}
+
+    valid_mix_modes = {
+        "posts_first_80_20",
+        "posts_first_60_40",
+        "balanced_50_50",
+        "posts_only",
+        "videos_only",
+    }
+    mix_mode = data.get("content_mix_mode", "posts_first_80_20")
+    result["content_mix_mode"] = mix_mode if mix_mode in valid_mix_modes else "posts_first_80_20"
+
+    for key in ("posts_target", "videos_target"):
+        val = data.get(key)
+        if val is not None:
+            try:
+                result[key] = max(0, int(val))
+            except (ValueError, TypeError):
+                pass
+
+    prioritize_posts = data.get("prioritize_posts", True)
+    result["prioritize_posts"] = (
+        prioritize_posts if isinstance(prioritize_posts, bool)
+        else str(prioritize_posts).strip().lower() in {"1", "true", "yes", "on"}
+    )
+
+    viral_only = data.get("viral_only", False)
+    result["viral_only"] = (
+        viral_only if isinstance(viral_only, bool)
+        else str(viral_only).strip().lower() in {"1", "true", "yes", "on"}
+    )
 
     return result
 
@@ -151,6 +181,7 @@ def deep_search_hashtag():
             "max_related_hashtags": int(data.get("max_related_hashtags", 10)),
             "max_per_query":        int(data.get("max_per_query", 300)),
             "max_total":            int(data.get("max_total", 1000)),
+            "types":                data.get("types", ["posts", "videos"]),
         }
         # Merge sort/filter params
         config.update(_extract_sort_filter(data))
@@ -178,7 +209,7 @@ def deep_search_trending():
     
     try:
         config = {
-            "sort_by":     data.get("sort_by", "engagement"),
+            "sort_by":     data.get("sort_by", "trending"),
             "types":       data.get("types", ["posts", "videos", "groups", "pages"]),
             "max_total":   int(data.get("max_total", 1000)),
         }

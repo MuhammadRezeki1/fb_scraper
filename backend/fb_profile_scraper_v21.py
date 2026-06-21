@@ -27,6 +27,7 @@ from urllib.parse import urlparse, parse_qs, quote
 from dotenv import load_dotenv
 from colorama import Fore, init
 from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeout
+from browser_runtime import browser_channel_kwargs
 
 init(autoreset=True)
 load_dotenv()
@@ -190,7 +191,7 @@ class FacebookProfileScraperV21:
 
         context = self.playwright.chromium.launch_persistent_context(
             FB_CHROME_PROFILE,
-            channel="chrome",
+            **browser_channel_kwargs(),
             headless=HEADLESS,
             args=args,
             no_viewport=True,

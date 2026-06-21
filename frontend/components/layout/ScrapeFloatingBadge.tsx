@@ -2,40 +2,115 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { CheckCircle, XCircle, Loader2, X } from "lucide-react";
 import { useScrape } from "@/contexts/ScrapeContext";
+import { api, type DeepPost } from "@/lib/api";
+
+function readPersistedDeepJobId(): string | null {
+  try {
+    const raw = sessionStorage.getItem("fb-scrape:deep-active-job-id");
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return typeof parsed === "string" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistDeepPosts(posts: DeepPost[]) {
+  try {
+    sessionStorage.setItem("fb-scrape:deep-posts-v2", JSON.stringify(posts));
+  } catch {
+    // Ignore storage quota errors; the Deep page can still fetch from backend.
+  }
+}
 
 export default function ScrapeFloatingBadge() {
-  const { job, clear } = useScrape();
+  const pathname = usePathname();
+  const { job, clear, finish, fail } = useScrape();
   const [elapsed, setElapsed]     = useState(0);
   const [dismissed, setDismissed] = useState(false);
   const startedAtRef              = useRef(0);
+  const jobId                     = job?.id;
+  const jobStatus                 = job?.status;
+  const jobStartedAt              = job?.startedAt;
+  const jobType                   = job?.type;
+  const deepPollInFlightRef       = useRef(false);
 
   useEffect(() => {
-    if (!job || job.status !== "running") return;
-    startedAtRef.current = job.startedAt;
-    setElapsed(0);
-    const id = setInterval(() => {
+    if (!jobStartedAt || jobStatus !== "running") return;
+    startedAtRef.current = jobStartedAt;
+    const resetId = window.setTimeout(() => setElapsed(0), 0);
+    const id = window.setInterval(() => {
       setElapsed(Math.round((Date.now() - startedAtRef.current) / 1000));
     }, 1000);
-    return () => clearInterval(id);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [job?.id, job?.status]);
-
-  useEffect(() => { if (job) setDismissed(false); }, [job?.id]);
+    return () => {
+      window.clearTimeout(resetId);
+      window.clearInterval(id);
+    };
+  }, [jobId, jobStatus, jobStartedAt]);
 
   useEffect(() => {
-    if (job?.status === "done" || job?.status === "error") {
-      const id = setTimeout(() => setDismissed(true), 10_000);
-      return () => clearTimeout(id);
+    if (!jobId) return;
+    const id = window.setTimeout(() => setDismissed(false), 0);
+    return () => window.clearTimeout(id);
+  }, [jobId]);
+
+  useEffect(() => {
+    if (jobStatus === "done" || jobStatus === "error") {
+      const id = window.setTimeout(() => setDismissed(true), 10_000);
+      return () => window.clearTimeout(id);
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [job?.status, job?.id]);
+  }, [jobStatus, jobId]);
+
+  useEffect(() => {
+    if (jobType !== "deep" || jobStatus !== "running") return;
+    if (pathname === "/monitor/deep") return;
+
+    let ignore = false;
+    const pollDeepJob = async () => {
+      const jobId = readPersistedDeepJobId();
+      if (!jobId) return;
+      if (deepPollInFlightRef.current) return;
+      deepPollInFlightRef.current = true;
+
+      try {
+        const statusRes = await api.deep.jobStatus(jobId);
+        const status = statusRes.data?.status;
+        if (!status || status === "running" || status === "pending") return;
+
+        if (status === "completed") {
+          const postsRes = await api.deep.jobPosts(jobId);
+          const posts = postsRes.data?.posts || [];
+          if (ignore) return;
+          persistDeepPosts(posts);
+          finish({ deepPosts: posts, elapsed: undefined });
+        } else if (status === "error") {
+          if (!ignore) fail(statusRes.data?.error || "Deep search gagal di backend");
+        } else if (status === "cancelled") {
+          if (!ignore) finish({ deepPosts: [], elapsed: undefined });
+        }
+      } catch (err) {
+        console.warn("Deep badge polling error:", err);
+      } finally {
+        deepPollInFlightRef.current = false;
+      }
+    };
+
+    pollDeepJob();
+    const id = window.setInterval(pollDeepJob, 15000);
+    return () => {
+      ignore = true;
+      deepPollInFlightRef.current = false;
+      window.clearInterval(id);
+    };
+  }, [jobType, jobStatus, pathname, finish, fail]);
 
   if (!job || dismissed) return null;
 
-  const typeLabel  = job.type === "post" ? "Post" : job.type === "profile" ? "Profil" : job.type;
-  const resultPath = job.type === "post" ? "/scrape/posts" : job.type === "profile" ? "/scrape/profiles" : "/";
+  const typeLabel  = job.type === "post" ? "Post" : job.type === "profile" ? "Profil" : job.type === "deep" ? "Deep Search" : job.type;
+  const resultPath = job.type === "post" ? "/scrape/posts" : job.type === "profile" ? "/scrape/profiles" : job.type === "deep" ? "/monitor/deep" : "/";
 
   return (
     <div
@@ -100,8 +175,9 @@ export default function ScrapeFloatingBadge() {
           <div className="flex items-center justify-between">
             <p className="text-xs" style={{ color: "#1d7a47" }}>
               {job.elapsed != null && `${job.elapsed}s`}
-              {job.type === "post"    && job.postResult           ? ` · ${job.postResult.comments_count} komentar` : ""}
-              {job.type === "profile" && job.profileResults.length ? ` · ${job.profileResults.length} profil`     : ""}
+              {job.type === "deep" && job.deepPosts.length ? ` - ${job.deepPosts.length} hasil` : ""}
+              {job.type === "post" && job.postResult ? ` - ${job.postResult.comments_count} komentar` : ""}
+              {job.type === "profile" && job.profileResults.length ? ` - ${job.profileResults.length} profil` : ""}
             </p>
             <Link href={resultPath}
               className="text-xs underline underline-offset-2 transition-colors" style={{ color: "#6b5ec7" }}>

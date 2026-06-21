@@ -5,7 +5,7 @@
 //  + Deep Monitoring (multi-query, auto-discovery, related topics)
 // ============================================================================
 
-const BASE = "/api/v1";
+const BASE = (process.env.NEXT_PUBLIC_API_BASE_PATH ?? "/api/v1").replace(/\/$/, "");
 
 // ----------------------------------------------------------------------------
 //  Helper: Request dengan fetch + JSON handling + sanitasi NaN/Infinity
@@ -234,7 +234,7 @@ export const api = {
 
     trending: async (
       max_results = 1000,
-      sort_by: MonitorSort = "engagement",
+      sort_by: MonitorSort = "trending",
       keyword: string = "",
       types: string[] = ["posts", "videos", "groups", "pages"],
       options: MonitorOptions = {}
@@ -266,12 +266,18 @@ export const api = {
         types?: string[];
         max_comments_per_post?: number;
         top_comments_count?: number;
-        sort_by?: string;
+        sort_by?: MonitorSort;
         min_likes?: number;
         min_comments?: number;
         min_views?: number;
         recent_days?: number;
         fast_mode?: boolean;
+        detail_enrich_limit?: number;
+        content_mix_mode?: ContentMixMode;
+        posts_target?: number;
+        videos_target?: number;
+        prioritize_posts?: boolean;
+        viral_only?: boolean;
       } = {}
     ) =>
       request<ApiResponse<{ job_id: string; mode: string; query: string }>>(
@@ -288,14 +294,21 @@ export const api = {
         max_related_hashtags?: number;
         max_per_query?: number;
         max_total?: number;
+        types?: string[];
         max_comments_per_post?: number;
         top_comments_count?: number;
-        sort_by?: string;
+        sort_by?: MonitorSort;
         min_likes?: number;
         min_comments?: number;
         min_views?: number;
         recent_days?: number;
         fast_mode?: boolean;
+        detail_enrich_limit?: number;
+        content_mix_mode?: ContentMixMode;
+        posts_target?: number;
+        videos_target?: number;
+        prioritize_posts?: boolean;
+        viral_only?: boolean;
       } = {}
     ) =>
       request<ApiResponse<{ job_id: string; mode: string; query: string }>>(
@@ -309,7 +322,7 @@ export const api = {
     trending: async (
       config: {
         keyword?: string;
-        sort_by?: "engagement" | "recent";
+        sort_by?: MonitorSort;
         types?: string[];
         max_total?: number;
         max_comments_per_post?: number;
@@ -319,6 +332,12 @@ export const api = {
         min_views?: number;
         recent_days?: number;
         fast_mode?: boolean;
+        detail_enrich_limit?: number;
+        content_mix_mode?: ContentMixMode;
+        posts_target?: number;
+        videos_target?: number;
+        prioritize_posts?: boolean;
+        viral_only?: boolean;
       } = {}
     ) =>
       request<ApiResponse<{ job_id: string; mode: string; query: string }>>(
@@ -596,7 +615,8 @@ export interface KeywordHit {
   rank?: number;
 }
 
-export type MonitorSort = "engagement" | "likes" | "comments" | "views" | "shares" | "recent";
+export type MonitorSort = "trending" | "viral" | "engagement" | "likes" | "comments" | "views" | "shares" | "recent";
+export type ContentMixMode = "posts_first_80_20" | "posts_first_60_40" | "balanced_50_50" | "posts_only" | "videos_only";
 
 export interface MonitorOptions {
   sort_by?: MonitorSort;
@@ -741,10 +761,20 @@ export interface DeepPost {
   caption: string;
   timestamp: string;
   type: string;
-  likes_count: number;
-  comments_count: number;
-  views_count: number;
-  shares_count: number;
+  likes_count: number | null;
+  comments_count: number | null;
+  views_count: number | null;
+  shares_count: number | null;
+  metrics_valid?: boolean;
+  metric_source?: string;
+  metrics_error?: string | null;
+  detail_status?: string;
+  detail_final_url?: string;
+  metric_patterns?: Record<string, string>;
+  viral_score?: number;
+  viral_level?: "unknown" | "low" | "potential" | "viral" | "strong_viral" | "very_viral";
+  viral_reason?: string;
+  content_priority?: number;
   deep_source?: string;
   deep_source_tag?: string;
   deep_root_query?: string;

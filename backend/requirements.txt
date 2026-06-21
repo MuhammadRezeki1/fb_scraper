@@ -1,0 +1,13 @@
+asgiref==3.8.1
+colorama==0.4.6
+emoji==2.14.1
+Flask==3.1.1
+flask-cors==6.0.1
+langdetect==1.0.9
+playwright==1.49.1
+python-dotenv==1.0.1
+uvicorn[standard]==0.34.3
+
+# Optional analytics helpers used by profile/debug modules.
+matplotlib==3.10.0
+pandas==2.2.3

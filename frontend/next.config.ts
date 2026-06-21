@@ -1,7 +1,13 @@
 import type { NextConfig } from "next";
 import path from "path";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8003";
+const BACKEND_API_URL = process.env.BACKEND_API_URL ?? process.env.NEXT_PUBLIC_API_URL;
+
+if (!BACKEND_API_URL) {
+  throw new Error("BACKEND_API_URL is required for Next.js API rewrites.");
+}
+
+const API_URL = BACKEND_API_URL.replace(/\/$/, "");
 
 const nextConfig: NextConfig = {
   turbopack: {

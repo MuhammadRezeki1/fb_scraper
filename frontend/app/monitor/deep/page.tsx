@@ -1,7 +1,7 @@
 "use client";
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { useRouter } from "next/navigation";
-import { api, DeepJobState, DeepPost } from "@/lib/api";
+import { api, ContentMixMode, DeepJobState, DeepPost } from "@/lib/api";
 import {
   Search, Loader2, ExternalLink, FileText, Users, Video,
   Grid3x3, Hash, TrendingUp, Play, Square, RefreshCw,
@@ -15,6 +15,8 @@ import { usePersistState } from "@/hooks/usePersistState";
 import { downloadJSON, downloadCSV } from "@/lib/download";
 
 type DeepMode = "keyword" | "hashtag" | "trending";
+type DeepSort = "trending" | "viral" | "engagement" | "likes" | "comments" | "shares" | "views" | "recent";
+type ResultFilter = "all" | "viral_plus" | "potential_plus" | "metrics_valid" | "hide_invalid";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -91,6 +93,26 @@ function compactUrl(url?: string) {
   }
 }
 
+// Apakah URL adalah permalink post asli yang bisa di-scrape detail.
+// Post dari kartu pencarian tanpa permalink memakai placeholder
+// (/search/posts/?...&fb_scrape_card=...) yang tidak bisa di-scrape detail.
+function isRealPostLink(url?: string): boolean {
+  if (!url) return false;
+  const u = url.toLowerCase();
+  if (u.includes("fb_scrape_card=") || u.includes("/search/posts/") || u.includes("/search/top/")) return false;
+  return (
+    /\/share\/(p|v|r)\//.test(u) ||
+    (/\/watch/.test(u) && /[?&]v=\d+/.test(u)) ||
+    /\/groups\/[^/]+\/(posts|permalink)\/\d+/.test(u) ||
+    /\/(posts|permalink)\/(?:\d+|pfbid)/.test(u) ||
+    /\/(videos?|reels?|reel)\/\d+/.test(u) ||
+    /\/photo\/?\?fbid=\d+/.test(u) ||
+    /[?&]fbid=\d+/.test(u) ||
+    /\/(photo|photos)\/\d+/.test(u) ||
+    /story_fbid=\d+/.test(u)
+  );
+}
+
 function primaryText(post: DeepPost) {
   return (post.group_about || post.caption || post.text || "").trim();
 }
@@ -110,11 +132,97 @@ function errorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
 }
 
-function fmtNum(n?: number): string {
+function fmtNum(n?: number | null): string {
   if (!n || n === 0) return "0";
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}jt`;
   if (n >= 1_000)     return `${(n / 1_000).toFixed(1)}rb`;
   return n.toLocaleString("id-ID");
+}
+
+function metricNum(value?: number | null): number {
+  return Number(value || 0);
+}
+
+function engagementValue(post: DeepPost): number {
+  return (
+    metricNum(post.likes_count) +
+    metricNum(post.comments_count) * 2 +
+    metricNum(post.shares_count) * 3 +
+    metricNum(post.views_count) * 0.1
+  );
+}
+
+function viralLevelValue(level?: string): number {
+  if (level === "very_viral") return 5;
+  if (level === "strong_viral") return 4;
+  if (level === "viral") return 3;
+  if (level === "potential") return 2;
+  if (level === "low") return 1;
+  return 0;
+}
+
+function viralLabel(level?: string): string {
+  if (level === "very_viral") return "Very Viral";
+  if (level === "strong_viral") return "Strong Viral";
+  if (level === "viral") return "Viral";
+  if (level === "potential") return "Potential";
+  return "";
+}
+
+function viralBadgeStyle(level?: string) {
+  if (level === "very_viral") return { background: "rgba(192,57,79,0.12)", color: "#b4233c" };
+  if (level === "strong_viral") return { background: "rgba(219,112,31,0.12)", color: "#b95716" };
+  if (level === "viral") return { background: "rgba(29,122,71,0.12)", color: "#1d7a47" };
+  if (level === "potential") return { background: "rgba(107,94,199,0.12)", color: "#5b4fc4" };
+  return { background: "rgba(136,144,170,0.12)", color: "#60687f" };
+}
+
+function passesResultFilter(post: DeepPost, filter: ResultFilter): boolean {
+  if (filter === "all") return true;
+  if (filter === "metrics_valid" || filter === "hide_invalid") return post.metrics_valid !== false;
+  const rank = viralLevelValue(post.viral_level);
+  if (filter === "viral_plus") return post.metrics_valid !== false && rank >= viralLevelValue("viral");
+  if (filter === "potential_plus") return post.metrics_valid !== false && rank >= viralLevelValue("potential");
+  return true;
+}
+
+function sortPostsForDisplay(items: DeepPost[], sortBy: DeepSort): DeepPost[] {
+  const isVideo = (post: DeepPost) => {
+    const t = (post.type || "").toLowerCase();
+    const u = (post.url || "").toLowerCase();
+    return ["videos", "video", "reel", "reels", "watch"].includes(t) || /\/(reel|reels|videos|watch)/.test(u);
+  };
+  const value = (post: DeepPost) => {
+    if (sortBy === "trending" || sortBy === "viral") {
+      if (isVideo(post)) {
+        return (
+          metricNum(post.views_count) * 1_000_000 +
+          metricNum(post.comments_count) * 10_000 +
+          metricNum(post.likes_count) * 100 +
+          metricNum(post.shares_count) * 50 +
+          metricNum(post.viral_score)
+        );
+      }
+      return (
+        metricNum(post.comments_count) * 1_000_000 +
+        metricNum(post.likes_count) * 10_000 +
+        metricNum(post.shares_count) * 1_000 +
+        metricNum(post.views_count) +
+        metricNum(post.viral_score)
+      );
+    }
+    if (sortBy === "likes") return metricNum(post.likes_count);
+    if (sortBy === "comments") return metricNum(post.comments_count);
+    if (sortBy === "shares") return metricNum(post.shares_count);
+    if (sortBy === "views") return metricNum(post.views_count);
+    if (sortBy === "recent") return post.timestamp ? Date.parse(post.timestamp) || 0 : 0;
+    return engagementValue(post);
+  };
+  return [...items].sort((a, b) => {
+    const diff = value(b) - value(a);
+    if (diff !== 0) return diff;
+    return (a.rank || Number.MAX_SAFE_INTEGER) - (b.rank || Number.MAX_SAFE_INTEGER);
+  });
 }
 
 // ─── CommentSection ──────────────────────────────────────────────────────────
@@ -266,6 +374,16 @@ function PostCard({ post, idx, onScrapePost }: { post: DeepPost; idx: number; on
               </span>
             )}
 
+            {post.metrics_valid === false ? (
+              <span className="text-xs px-2 py-0.5 rounded-full" style={{ background: "rgba(136,144,170,0.12)", color: "#60687f" }}>
+                Metrics belum valid
+              </span>
+            ) : viralLabel(post.viral_level) ? (
+              <span className="text-xs font-semibold px-2 py-0.5 rounded-full" style={viralBadgeStyle(post.viral_level)}>
+                {viralLabel(post.viral_level)}
+              </span>
+            ) : null}
+
             {/* Source tag */}
             {sourceLabel(post) !== "Tanpa sumber" && (
               <span className="text-xs px-2 py-0.5 rounded-full" style={{ background: "rgba(29,122,71,0.08)", color: "#1d7a47" }}>
@@ -315,14 +433,14 @@ function PostCard({ post, idx, onScrapePost }: { post: DeepPost; idx: number; on
           {/* Row 4: Engagement metrics */}
           {(realPost || hasContent_ || hasEngage) ? (
             <div className="flex flex-wrap items-center gap-3">
-              {(post.likes_count || 0) >= 0 && (
+              {post.likes_count != null && (
                 <span className="flex items-center gap-1.5 text-xs font-medium" style={{ color: "#4a5070" }}>
                   {/* ✅ FIX: Heart icon dari lucide, bukan \u2764 string */}
                   <Heart size={14} style={{ color: "#e0245e" }} fill="#e0245e" />
                   {fmtNum(post.likes_count)}
                 </span>
               )}
-              {(post.comments_count || 0) >= 0 && (
+              {post.comments_count != null && (
                 <span className="flex items-center gap-1.5 text-xs font-medium" style={{ color: "#4a5070" }}>
                   <MessageCircle size={14} style={{ color: "#3b6dce" }} />
                   {fmtNum(post.comments_count)}
@@ -335,10 +453,15 @@ function PostCard({ post, idx, onScrapePost }: { post: DeepPost; idx: number; on
                 </span>
               )}
               {/* ✅ FIX: Shares menggunakan Share2 icon */}
-              {(post.shares_count || 0) >= 0 && (
+              {post.shares_count != null && (
                 <span className="flex items-center gap-1.5 text-xs font-medium" style={{ color: "#4a5070" }}>
                   <Share2 size={14} style={{ color: "#1d7a47" }} />
                   {fmtNum(post.shares_count)}
+                </span>
+              )}
+              {post.metrics_valid === false && (
+                <span className="text-xs px-2 py-1 rounded-full" style={{ background: "rgba(192,57,79,0.08)", color: "#c0394f" }}>
+                  metrics: {post.metric_source || "unverified"}
                 </span>
               )}
             </div>
@@ -370,14 +493,22 @@ function PostCard({ post, idx, onScrapePost }: { post: DeepPost; idx: number; on
           >
             <ExternalLink size={12} /> Buka FB
           </a>
-          <button
-            onClick={() => onScrapePost(post.url)}
-            title="Scrape detail postingan ini"
-            className="flex-1 lg:flex-none flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium transition-all hover:bg-green-50"
-            style={{ color: "#1d7a47", border: "1px solid rgba(29,122,71,0.2)", background: "rgba(29,122,71,0.05)" }}
-          >
-            <FileText size={12} /> Scrape Post
-          </button>
+          {(() => {
+            const canScrape = isRealPostLink(post.url);
+            return (
+              <button
+                onClick={() => canScrape && onScrapePost(post.url)}
+                disabled={!canScrape}
+                title={canScrape
+                  ? "Scrape detail postingan ini"
+                  : "Tidak bisa scrape detail — post ini ditangkap dari kartu pencarian dan Facebook tidak memberi permalink aslinya"}
+                className="flex-1 lg:flex-none flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium transition-all hover:bg-green-50 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+                style={{ color: "#1d7a47", border: "1px solid rgba(29,122,71,0.2)", background: "rgba(29,122,71,0.05)" }}
+              >
+                <FileText size={12} /> Scrape Post
+              </button>
+            );
+          })()}
           <DownloadButton
             data={post}
             filename={`fb-post-${post.author || "unknown"}-${idx}`}
@@ -394,17 +525,19 @@ function PostCard({ post, idx, onScrapePost }: { post: DeepPost; idx: number; on
 
 export default function DeepSearchPage() {
   const router = useRouter();
-  const { job, isRunning, start, finish, fail, setAutoFillUrl } = useScrape();
+  const { job, isRunning, start, finish, fail, clear, setAutoFillUrl } = useScrape();
 
   const [mode,    setMode]    = usePersistState<DeepMode>("deep-mode",  "keyword");
   const [query,   setQuery]   = usePersistState("deep-query",           "");
   const [types,   setTypes]   = usePersistState<string[]>("deep-types", ["posts", "videos"]);
-  const [sortBy,  setSortBy]  = usePersistState<"engagement" | "recent">("deep-sort", "engagement");
+  const [sortBy,  setSortBy]  = usePersistState<DeepSort>("deep-sort-v3", "trending");
+  const [contentMixMode, setContentMixMode] = usePersistState<ContentMixMode>("deep-content-mix-mode", "posts_first_80_20");
+  const [resultFilter, setResultFilter] = usePersistState<ResultFilter>("deep-result-filter", "all");
   const [maxTotal,            setMaxTotal]            = useState(1000);
   const [recentDays,          setRecentDays]          = useState(30);
   const [fastMode,            setFastMode]            = useState(true);
 
-  const [jobId,     setJobId]     = useState<string | null>(null);
+  const [jobId,     setJobId]     = usePersistState<string | null>("deep-active-job-id", null);
   const [jobState,  setJobState]  = useState<DeepJobState | null>(null);
   const [posts,     setPosts]     = useState<DeepPost[]>([]);
   const [loading,   setLoading]   = useState(false);
@@ -416,6 +549,8 @@ export default function DeepSearchPage() {
   const [cachedPosts, setCachedPosts] = usePersistState<DeepPost[]>("deep-posts-v2", []);
 
   const pollRef        = useRef<NodeJS.Timeout | null>(null);
+  const pollInFlightRef = useRef(false);
+  const lastPartialFetchRef = useRef(0);
   const cancelledRef   = useRef(false);
   const activeJobIdRef = useRef<string | null>(null);
 
@@ -443,10 +578,13 @@ export default function DeepSearchPage() {
   const effectiveSource = activeSource === "all" || sourceOptions.some(opt => opt.label === activeSource)
     ? activeSource
     : "all";
-  const displayPosts = useMemo(
-    () => effectiveSource === "all" ? baseDisplayPosts : baseDisplayPosts.filter(post => sourceLabel(post) === effectiveSource),
-    [effectiveSource, baseDisplayPosts],
-  );
+  const displayPosts = useMemo(() => {
+    const sourceFiltered = effectiveSource === "all"
+      ? baseDisplayPosts
+      : baseDisplayPosts.filter(post => sourceLabel(post) === effectiveSource);
+    const filtered = sourceFiltered.filter(post => passesResultFilter(post, resultFilter));
+    return sortPostsForDisplay(filtered, sortBy);
+  }, [effectiveSource, baseDisplayPosts, resultFilter, sortBy]);
 
   const groups = useMemo(() => groupByType(displayPosts), [displayPosts]);
 
@@ -455,6 +593,27 @@ export default function DeepSearchPage() {
     { value: "videos",  label: "Video/Reels", icon: Video    },
     { value: "pages",   label: "Halaman",     icon: Users    },
     { value: "groups",  label: "Grup",        icon: Grid3x3  },
+  ];
+  const sortOptions: Array<{ value: DeepSort; label: string }> = [
+    { value: "trending", label: "Trending" },
+    { value: "likes", label: "Like" },
+    { value: "comments", label: "Komentar" },
+    { value: "shares", label: "Share" },
+    { value: "views", label: "Views" },
+  ];
+  const contentMixOptions: Array<{ value: ContentMixMode; label: string }> = [
+    { value: "posts_first_80_20", label: "Prioritas Posts 80/20" },
+    { value: "posts_first_60_40", label: "Posts 60 / Reels 40" },
+    { value: "balanced_50_50", label: "Balanced 50/50" },
+    { value: "posts_only", label: "Posts Only" },
+    { value: "videos_only", label: "Videos Only" },
+  ];
+  const resultFilterOptions: Array<{ value: ResultFilter; label: string }> = [
+    { value: "all", label: "Semua" },
+    { value: "viral_plus", label: "Viral+" },
+    { value: "potential_plus", label: "Potential+" },
+    { value: "metrics_valid", label: "Metrics valid saja" },
+    { value: "hide_invalid", label: "Sembunyikan invalid" },
   ];
 
   const toggleType = (val: string) => {
@@ -466,23 +625,73 @@ export default function DeepSearchPage() {
   }, []);
 
   useEffect(() => {
+    if (jobId) return;
+    if (!isMyRun) return;
+
+    let ignore = false;
+    const recoverLatestJob = async () => {
+      try {
+        const res = await api.deep.jobs();
+        const jobs = (res.data?.jobs || [])
+          .filter(j => j.mode === mode)
+          .sort((a, b) => new Date(b.updated_at || b.created_at).getTime() - new Date(a.updated_at || a.created_at).getTime());
+
+        if (ignore || jobs.length === 0) return;
+
+        const wanted = (job?.type === "deep" ? job.label : query).trim().toLowerCase();
+        const matchedCandidates = wanted
+          ? jobs.filter(j => (j.query || "").toLowerCase().includes(wanted) || wanted.includes((j.query || "").toLowerCase()))
+          : jobs;
+        const candidates = matchedCandidates.length > 0 ? matchedCandidates : jobs;
+
+        const latestRunning = candidates.find(j => j.status === "running" || j.status === "pending");
+        if (!latestRunning) return;
+
+        setJobId(latestRunning.job_id);
+        setLoading(true);
+      } catch (err) {
+        console.warn("Deep job recovery failed:", errorMessage(err, "unknown"));
+      }
+    };
+
+    recoverLatestJob();
+    return () => { ignore = true; };
+  }, [jobId, mode, query, job, isMyRun, setJobId]);
+
+  useEffect(() => {
+    if (!jobId || isMyRun || loading || jobState) return;
+    setJobId(null);
+    activeJobIdRef.current = null;
+    const id = window.setTimeout(() => setLoading(false), 0);
+    return () => window.clearTimeout(id);
+  }, [jobId, isMyRun, loading, jobState, setJobId]);
+
+  useEffect(() => {
     if (!jobId) return;
+    if (!isMyRun) return;
     activeJobIdRef.current = jobId;
     cancelledRef.current   = false;
 
     const poll = async () => {
       if (cancelledRef.current || activeJobIdRef.current !== jobId) { stopPolling(); return; }
+      if (pollInFlightRef.current) return;
+      pollInFlightRef.current = true;
       try {
         const res = await api.deep.jobStatus(jobId);
         if (!res.data) return;
         setJobState(res.data);
+        setLoading(res.data.status === "running" || res.data.status === "pending");
 
         if (res.data.status === "running" || res.data.status === "pending") {
           try {
-            const partialRes = await api.deep.jobPostsPartial(jobId);
-            if (partialRes.data?.posts?.length) {
-              setPosts(partialRes.data.posts);
-              setCachedPosts(partialRes.data.posts);
+            const now = Date.now();
+            if (now - lastPartialFetchRef.current >= 15_000) {
+              lastPartialFetchRef.current = now;
+              const partialRes = await api.deep.jobPostsPartial(jobId);
+              if (partialRes.data?.posts?.length) {
+                setPosts(partialRes.data.posts);
+                setCachedPosts(partialRes.data.posts);
+              }
             }
           } catch (e: unknown) { console.warn("Partial fetch error:", errorMessage(e, "unknown")); }
         }
@@ -490,12 +699,17 @@ export default function DeepSearchPage() {
         if (res.data.status === "completed" || res.data.status === "cancelled") {
           stopPolling(); setLoading(false);
           if (res.data.status === "completed") {
-            const postsRes = await api.deep.jobPosts(jobId);
-            if (postsRes.data) {
-              const fp = postsRes.data.posts || [];
-              setPosts(fp); setCachedPosts(fp);
-              finish({ deepPosts: fp, elapsed: undefined });
+            let fp: DeepPost[] = [];
+            try {
+              const postsRes = await api.deep.jobPosts(jobId);
+              fp = postsRes.data?.posts || [];
+            } catch (finalErr) {
+              console.warn("Final fetch error, falling back to partial:", errorMessage(finalErr, "unknown"));
+              const partialRes = await api.deep.jobPostsPartial(jobId);
+              fp = partialRes.data?.posts || [];
             }
+            setPosts(fp); setCachedPosts(fp);
+            finish({ deepPosts: fp, elapsed: undefined });
           } else { finish({ deepPosts: [], elapsed: undefined }); }
         } else if (res.data.status === "error") {
           stopPolling();
@@ -508,14 +722,21 @@ export default function DeepSearchPage() {
         if (errorMessage(err, "").includes("cancelled")) {
           stopPolling(); setLoading(false);
           finish({ deepPosts: [], elapsed: undefined });
+        } else if (errorMessage(err, "").includes("tidak ditemukan") || errorMessage(err, "").includes("404")) {
+          stopPolling(); setLoading(false); setJobId(null);
+          setError("Job deep search tidak ditemukan di backend. Jalankan ulang scraping.");
+        } else {
+          console.warn("Deep polling error:", errorMessage(err, "unknown"));
         }
+      } finally {
+        pollInFlightRef.current = false;
       }
     };
 
     poll();
-    pollRef.current = setInterval(poll, 5000);
+    pollRef.current = setInterval(poll, 8000);
     return () => { stopPolling(); };
-  }, [jobId, finish, fail, setCachedPosts, stopPolling]);
+  }, [jobId, isMyRun, finish, fail, setCachedPosts, setJobId, stopPolling]);
 
   const handleStart = async () => {
     if (!query.trim() && mode !== "trending") { setError("Query wajib diisi"); return; }
@@ -528,12 +749,24 @@ export default function DeepSearchPage() {
     try {
       let res;
       const selectedTypes = types.length ? types : ["posts", "videos"];
-      const runTypes = fastMode
+      let runTypes = fastMode
         ? (selectedTypes.filter(t => t === "posts" || t === "videos").length
             ? selectedTypes.filter(t => t === "posts" || t === "videos")
             : ["posts", "videos"])
         : selectedTypes;
-      const commonConfig = { max_total: maxTotal, recent_days: recentDays, fast_mode: fastMode };
+      if (contentMixMode === "posts_only") runTypes = runTypes.filter(t => t !== "videos");
+      if (contentMixMode === "videos_only") runTypes = ["videos"];
+      if (runTypes.length === 0) runTypes = contentMixMode === "videos_only" ? ["videos"] : ["posts"];
+      const commonConfig = {
+        max_total: maxTotal,
+        recent_days: recentDays,
+        fast_mode: fastMode,
+        sort_by: sortBy,
+        detail_enrich_limit: Math.min(maxTotal, fastMode ? 60 : 150),
+        content_mix_mode: contentMixMode,
+        prioritize_posts: true,
+        viral_only: false,
+      };
       if (mode === "keyword") {
         res = await api.deep.keyword(query, {
           ...commonConfig,
@@ -546,12 +779,12 @@ export default function DeepSearchPage() {
           ...commonConfig,
           max_related_hashtags: fastMode ? 2 : 10,
           max_per_query: fastMode ? 100 : 300,
+          types: runTypes,
         });
       } else {
         res = await api.deep.trending({
           ...commonConfig,
           keyword: query,
-          sort_by: sortBy,
           types: runTypes,
         });
       }
@@ -569,18 +802,29 @@ export default function DeepSearchPage() {
     try {
       await api.deep.cancelJob(jobId);
       setJobState(prev => prev ? { ...prev, status: "cancelled" } : null);
+      setJobId(null);
+      activeJobIdRef.current = null;
       setLoading(false);
       finish({ deepPosts: [], elapsed: undefined });
     } catch {
+      setJobId(null);
+      activeJobIdRef.current = null;
       setLoading(false);
       finish({ deepPosts: [], elapsed: undefined });
     }
   };
 
   const handleReset = () => {
+    const activeId = jobId;
+    if (activeId && loading) {
+      void api.deep.cancelJob(activeId).catch(err => {
+        console.warn("Reset cancel failed:", errorMessage(err, "unknown"));
+      });
+    }
     stopPolling(); setJobId(null); setJobState(null); setPosts([]);
     setCachedPosts([]); setError(""); setLoading(false); setShowEmpty(false); setActiveSource("all");
-    cancelledRef.current = false; activeJobIdRef.current = null;
+    cancelledRef.current = false; activeJobIdRef.current = null; pollInFlightRef.current = false; lastPartialFetchRef.current = 0;
+    clear();
   };
 
   const handleScrapePost = useCallback((url: string) => {
@@ -668,23 +912,10 @@ export default function DeepSearchPage() {
                 Pisahkan dengan koma untuk memproses beberapa trending keyword.
               </p>
             </div>
-            <div>
-              <label className="text-sm font-medium mb-2 block" style={{ color: "#4a5070" }}>Sort By</label>
-              <div className="flex gap-2">
-                {(["engagement", "recent"] as const).map(s => (
-                  <button key={s} onClick={() => setSortBy(s)} disabled={isMyRun}
-                    className="flex-1 px-4 py-2.5 rounded-xl text-sm font-medium transition-all"
-                    style={{ background: sortBy === s ? "rgba(192,57,79,0.1)" : "rgba(0,0,0,0.04)", color: sortBy === s ? "#c0394f" : "#4a5070", border: sortBy === s ? "1px solid rgba(192,57,79,0.25)" : "1px solid transparent" }}
-                  >
-                    {s === "engagement" ? "Engagement" : "Terbaru"}
-                  </button>
-                ))}
-              </div>
-            </div>
           </>
         )}
 
-        {mode !== "hashtag" && (
+        {(
           <div>
             <label className="text-sm font-medium mb-2 block" style={{ color: "#4a5070" }}>Tipe Konten</label>
             <div className="flex flex-wrap gap-2">
@@ -704,6 +935,27 @@ export default function DeepSearchPage() {
             </div>
           </div>
         )}
+
+        <div>
+          <label className="text-sm font-medium mb-2 block" style={{ color: "#4a5070" }}>Prioritas Konten</label>
+          <div className="flex flex-wrap gap-2">
+            {contentMixOptions.map(opt => (
+              <button
+                key={opt.value}
+                onClick={() => setContentMixMode(opt.value)}
+                disabled={isMyRun}
+                className="px-3 py-2 rounded-xl text-sm font-medium transition-all"
+                style={{
+                  background: contentMixMode === opt.value ? "rgba(107,94,199,0.1)" : "rgba(0,0,0,0.04)",
+                  color: contentMixMode === opt.value ? "#6b5ec7" : "#4a5070",
+                  border: contentMixMode === opt.value ? "1px solid rgba(107,94,199,0.25)" : "1px solid transparent",
+                }}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </div>
 
         <label
           className="flex items-start gap-3 rounded-xl px-4 py-3 text-sm"
@@ -751,11 +1003,11 @@ export default function DeepSearchPage() {
               <Square size={18} /> Cancel Job
             </button>
           )}
-          {jobState && ["completed", "error", "cancelled"].includes(jobState.status) && (
+          {(jobId || jobState || allPosts.length > 0) && (
             <button onClick={handleReset}
               className="flex-1 py-3 rounded-xl flex items-center justify-center gap-2 font-semibold transition-all"
               style={{ background: "rgba(0,0,0,0.05)", color: "#4a5070" }}>
-              <RefreshCw size={18} /> Reset
+              <RefreshCw size={18} /> Reset Tampilan
             </button>
           )}
         </div>
@@ -805,6 +1057,30 @@ export default function DeepSearchPage() {
       {/* Results */}
       {allPosts.length > 0 && (
         <>
+          <div className="glass rounded-2xl p-2 flex items-center justify-between gap-3 flex-wrap">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="px-2 text-xs font-semibold" style={{ color: "#4a5070" }}>Urutkan</span>
+              {sortOptions.map(s => (
+                <button key={s.value} onClick={() => setSortBy(s.value)}
+                  className="px-3 py-2 rounded-lg text-xs font-medium transition-all"
+                  style={{ background: sortBy === s.value ? "rgba(192,57,79,0.1)" : "transparent", color: sortBy === s.value ? "#c0394f" : "#4a5070", border: sortBy === s.value ? "1px solid rgba(192,57,79,0.25)" : "1px solid transparent" }}
+                >
+                  {s.label}
+                </button>
+              ))}
+            </div>
+            <select
+              value={resultFilter}
+              onChange={e => setResultFilter(e.target.value as ResultFilter)}
+              className="px-3 py-2 rounded-lg text-xs font-medium outline-none"
+              style={{ background: "rgba(107,94,199,0.08)", color: "#4a5070", border: "1px solid rgba(107,94,199,0.16)" }}
+            >
+              {resultFilterOptions.map(opt => (
+                <option key={opt.value} value={opt.value}>{opt.label}</option>
+              ))}
+            </select>
+          </div>
+
           {/* Show empty toggle */}
           {limitedPosts.length > 0 && (
             <div className="flex items-center justify-between px-1">

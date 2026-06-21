@@ -5,6 +5,7 @@ from urllib.parse import quote, urlparse, parse_qs
 from dotenv import load_dotenv
 from colorama import Fore, init
 from playwright.sync_api import sync_playwright, Page, BrowserContext, Response
+from browser_runtime import browser_channel_kwargs
 
 init(autoreset=True); load_dotenv()
 HEADLESS = os.getenv("FB_HEADLESS", "False").lower() == "true"
@@ -25,26 +26,113 @@ FB_TYPE_SWITCH_DELAY = float(os.getenv("FB_TYPE_SWITCH_DELAY", "0.25"))
 FB_PAGE_DEEP_OPEN_LIMIT = int(os.getenv("FB_PAGE_DEEP_OPEN_LIMIT", "0"))
 os.makedirs("output_facebook", exist_ok=True); os.makedirs("fb_keyword_debug", exist_ok=True)
 
+def _metric_value(value) -> int:
+    try:
+        if value is None:
+            return 0
+        return int(value or 0)
+    except Exception:
+        return 0
+
 def _engagement_score(item):
     """Return a score comparable across normal posts and videos."""
     return (
-        item.get("likes_count", 0)
-        + item.get("comments_count", 0) * 2
-        + item.get("shares_count", 0) * 3
-        + item.get("views_count", 0) * 0.1
+        _metric_value(item.get("likes_count"))
+        + _metric_value(item.get("comments_count")) * 2
+        + _metric_value(item.get("shares_count")) * 3
+        + _metric_value(item.get("views_count")) * 0.1
+    )
+
+VIRAL_LEVEL_ORDER = {
+    "unknown": 0,
+    "low": 1,
+    "potential": 2,
+    "viral": 3,
+    "strong_viral": 4,
+    "very_viral": 5,
+}
+
+def _viral_level(score: float) -> str:
+    if score < 100:
+        return "low"
+    if score < 300:
+        return "potential"
+    if score < 1000:
+        return "viral"
+    if score < 3000:
+        return "strong_viral"
+    return "very_viral"
+
+def assign_viral_fields(item: dict) -> dict:
+    if not item:
+        return item
+    likes = _metric_value(item.get("likes_count"))
+    comments = _metric_value(item.get("comments_count"))
+    shares = _metric_value(item.get("shares_count"))
+    views = _metric_value(item.get("views_count"))
+    has_any_metric = any(v > 0 for v in (likes, comments, shares, views))
+    if item.get("metrics_valid") is False or not has_any_metric:
+        item["metrics_valid"] = False
+        item["viral_score"] = 0
+        item["viral_level"] = "unknown"
+        item["viral_reason"] = "metrics belum valid"
+        return item
+
+    score = likes + comments * 4 + shares * 6 + views * 0.02
+    reasons = []
+    viral_hit = False
+    if _is_video_item(item) and views >= 10000:
+        viral_hit = True
+        reasons.append("views >= 10000")
+    if comments >= 30:
+        viral_hit = True
+        reasons.append("comments >= 30")
+    if likes >= 100:
+        viral_hit = True
+        reasons.append("likes >= 100")
+    if shares >= 10:
+        viral_hit = True
+        reasons.append("shares >= 10")
+    if score >= 300:
+        viral_hit = True
+        reasons.append("viral_score >= 300")
+    if not reasons:
+        reasons.append("engagement rendah")
+
+    level = _viral_level(score)
+    if viral_hit and VIRAL_LEVEL_ORDER.get(level, 0) < VIRAL_LEVEL_ORDER["viral"]:
+        level = "viral"
+    item["viral_score"] = round(score, 2)
+    item["viral_level"] = level
+    item["viral_reason"] = ", ".join(reasons)
+    return item
+
+def _viral_sort_key(item: dict):
+    assign_viral_fields(item)
+    return (
+        VIRAL_LEVEL_ORDER.get(item.get("viral_level", "unknown"), 0),
+        float(item.get("viral_score") or 0),
+        _metric_value(item.get("comments_count")),
+        _metric_value(item.get("views_count")),
     )
 
 def _apply_sort(items,sort_by):
     if not items: return items
-    m={"engagement":lambda x:_engagement_score(x),"likes":lambda x:x.get("likes_count",0),"comments":lambda x:x.get("comments_count",0),
-       "views":lambda x:x.get("views_count",0),"shares":lambda x:x.get("shares_count",0),"recent":lambda x:x.get("timestamp","")}
+    for item in items:
+        assign_viral_fields(item)
+    if sort_by in ("engagement", "viral", "trending", "", None):
+        items.sort(key=_viral_sort_key, reverse=True)
+        for i,p in enumerate(items,1): p["rank"]=i
+        return items
+    m={"engagement":lambda x:_engagement_score(x),"likes":lambda x:_metric_value(x.get("likes_count")),"comments":lambda x:_metric_value(x.get("comments_count")),
+       "views":lambda x:_metric_value(x.get("views_count")),"shares":lambda x:_metric_value(x.get("shares_count")),"recent":lambda x:x.get("timestamp","")}
     items.sort(key=m.get(sort_by,m["engagement"]),reverse=True)
     for i,p in enumerate(items,1): p["rank"]=i
     return items
 
 def _apply_min_filters(items,ml=None,mc=None,mv=None):
     if ml is None and mc is None and mv is None: return items
-    return [i for i in items if not(ml is not None and i.get("likes_count",0)<ml or mc is not None and i.get("comments_count",0)<mc or mv is not None and i.get("views_count",0)<mv)]
+    return [i for i in items if not(ml is not None and _metric_value(i.get("likes_count"))<ml or mc is not None and _metric_value(i.get("comments_count"))<mc or mv is not None and _metric_value(i.get("views_count"))<mv)]
 
 def _is_commentable_url(url):
     if not url: return False
@@ -102,6 +190,14 @@ def _is_valid_result_url(url):
 
     return False
 
+def _is_video_url(url: str) -> bool:
+    u = (url or "").lower()
+    return any(x in u for x in ("/watch", "/reel/", "/reels/", "/videos/", "/video/", "/share/v/"))
+
+def _is_video_item(item: dict) -> bool:
+    typ = (item.get("type") or "").lower()
+    return typ in ("videos", "video", "reel", "reels", "watch") or _is_video_url(item.get("url", ""))
+
 def _keyword_in_item(item: dict, keyword: str) -> bool:
     """
     Enhanced keyword matching:
@@ -114,15 +210,19 @@ def _keyword_in_item(item: dict, keyword: str) -> bool:
         return True
     kw = keyword.lower().strip().lstrip('#')
     kw_nospace = kw.replace(" ", "").replace("-", "").replace("_", "")
-    # Collect all text fields
+    # Synthetic search cards must prove relevance from visible content.
+    # Their URL/matched_via contains the search query by construction.
     fields_to_check = [
         (item.get("text","") or item.get("caption","") or "").lower(),
         (item.get("author","") or "").lower(),
-        (item.get("url","") or "").lower(),
         (item.get("group_name","") or "").lower(),
         (item.get("page_name","") or "").lower(),
-        (item.get("matched_via","") or "").lower(),
     ]
+    if item.get("source") != "search_post_card":
+        fields_to_check.extend([
+            (item.get("url","") or "").lower(),
+            (item.get("matched_via","") or "").lower(),
+        ])
     for field in fields_to_check:
         if not field:
             continue
@@ -240,6 +340,124 @@ def _parse_compact_number(value: str) -> int:
         n *= 1_000_000
     return int(n)
 
+def parse_fb_number(text: str) -> Optional[int]:
+    """Parse Facebook compact numbers in Indonesian and English formats."""
+    if text is None:
+        return None
+    raw = str(text).strip().lower()
+    raw = (raw.replace("\u00a0", " ")
+              .replace("\xa0", " ")
+              .replace("Ã‚", " ")
+              .replace("ï¿½", " "))
+    raw = raw.replace("Â", " ").replace("Ã‚", " ").replace("â€¦", " ")
+    m = re.search(r'(\d+(?:[.,]\d+)?|\d{1,3}(?:[.,]\d{3})+)\s*(ribu|juta|mio|mn|rb|jt|k|m)?(?![a-z])', raw, re.I)
+    if not m:
+        return None
+    num = m.group(1)
+    suffix = (m.group(2) or "").lower()
+    try:
+        if suffix:
+            n = float(num.replace(",", "."))
+        else:
+            n = float(num.replace(".", "").replace(",", ""))
+    except ValueError:
+        return None
+    if suffix in ("rb", "ribu", "k"):
+        n *= 1_000
+    elif suffix in ("jt", "juta", "m", "mio", "mn"):
+        n *= 1_000_000
+    return int(n)
+
+def extract_reel_footer_metrics_from_text(text: str) -> dict:
+    """
+    Facebook Reels detail pages often expose unlabeled engagement counts as:
+    Publik / <likes> / <comments> / <shares> / Reels.
+    Only parse that tight footer block so caption numbers are ignored.
+    """
+    result = {
+        "likes_count": None,
+        "comments_count": None,
+        "shares_count": None,
+        "views_count": None,
+        "matched_patterns": {},
+    }
+    raw = (text or "").replace("\u00a0", " ").replace("\xa0", " ").replace("Â", " ").replace("Ã‚", " ")
+    lines = [re.sub(r"\s+", " ", line).strip() for line in raw.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return result
+
+    numeric_re = re.compile(r'^\d+(?:[.,]\d+)?\s*(?:ribu|juta|mio|mn|rb|jt|k|m)?$', re.I)
+    reel_indexes = [idx for idx, line in enumerate(lines) if line.lower() in {"reels", "reel"}]
+    for reel_idx in reversed(reel_indexes):
+        start = max(0, reel_idx - 10)
+        window = lines[start:reel_idx]
+        public_positions = [i for i, line in enumerate(window) if line.lower() in {"publik", "public"}]
+        if public_positions:
+            window = window[public_positions[-1] + 1:]
+        values = []
+        value_lines = []
+        for line in window:
+            clean_line = re.sub(r"[^\d.,a-zA-Z ]+", " ", line).strip()
+            if not numeric_re.match(clean_line):
+                continue
+            value = parse_fb_number(clean_line)
+            if value is None:
+                continue
+            values.append(value)
+            value_lines.append(clean_line)
+        if not values:
+            continue
+        # Reels footer order follows the visible action row: reactions, comments, shares.
+        for field, value, source_line in zip(("likes_count", "comments_count", "shares_count"), values[:3], value_lines[:3]):
+            result[field] = value
+            result["matched_patterns"][field] = f"reel_footer:{source_line}"
+        return result
+    return result
+
+def extract_video_metrics_from_text(text: str) -> dict:
+    """Extract video metrics only when a number has nearby metric words."""
+    text = re.sub(r"\s+", " ", (text or "").replace("\u00a0", " ")).strip()
+    result = {
+        "views": None,
+        "likes": None,
+        "comments": None,
+        "shares": None,
+        "matched_patterns": {},
+    }
+    num = r'(\d+(?:[.,]\d+)?|\d{1,3}(?:[.,]\d{3})+)\s*(ribu|juta|mio|mn|rb|jt|k|m)?(?![a-z])'
+    specs = {
+        "views": [
+            rf'{num}\s*(?:tayangan|views?|ditonton|viewed)\b',
+            rf'(?:tayangan|views?|ditonton|viewed)\s*[:\-]\s*{num}',
+        ],
+        "likes": [
+            rf'{num}\s*(?:suka|likes?|reaksi|reactions?)\b',
+            rf'(?:suka|likes?|reaksi|reactions?)\s*[:\-]\s*{num}',
+        ],
+        "comments": [
+            rf'{num}\s*(?:komentar|comments?)\b',
+            rf'(?:komentar|comments?)\s*[:\-]\s*{num}',
+        ],
+        "shares": [
+            rf'{num}\s*(?:kali\s+dibagikan|x\s+dibagikan|dibagikan|shares?)\b',
+            rf'(?:dibagikan|shares?)\s*[:\-]\s*{num}',
+        ],
+    }
+    for field, patterns in specs.items():
+        for pat in patterns:
+            for m in re.finditer(pat, text, re.I):
+                before = text[max(0, m.start() - 32):m.start()]
+                if re.search(r'(tayangan|views?|ditonton|viewed|komentar|comments?|suka|likes?|reaksi|reactions?|dibagikan|shares?)\s*[:\-]\s*$', before, re.I):
+                    continue
+                value = parse_fb_number(" ".join(part for part in m.groups()[:2] if part))
+                if value is None:
+                    continue
+                if result[field] is None or value > result[field]:
+                    result[field] = value
+                    result["matched_patterns"][field] = m.group(0)[:160]
+    return result
+
 class FacebookKeywordMonitor:
     def __init__(self):
         print(Fore.CYAN+"\n[FB] v5.3...")
@@ -329,7 +547,7 @@ class FacebookKeywordMonitor:
     def _build_context(self):
         self.playwright=sync_playwright().start()
         context=self.playwright.chromium.launch_persistent_context(
-            os.path.join(os.getcwd(),"fb_chrome_real_profile"),channel="chrome",headless=HEADLESS,
+            os.path.join(os.getcwd(),"fb_chrome_real_profile"),**browser_channel_kwargs(),headless=HEADLESS,
             args=["--window-size=1920,1080","--disable-blink-features=AutomationControlled","--disable-notifications","--mute-audio"],
             no_viewport=True,user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/148.0.0.0 Safari/537.36",
             locale="id-ID",timezone_id="Asia/Jakarta",bypass_csp=True)
@@ -355,7 +573,12 @@ class FacebookKeywordMonitor:
         self.page=self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
         try:
             from fb_cookie_injector import inject_cookies_sync
-            if self._has_cookie: inject_cookies_sync(self.ctx); print(Fore.GREEN+"   [OK] Cookies diinject")
+            if self._has_cookie:
+                try:
+                    self.ctx.clear_cookies()
+                except Exception:
+                    pass
+                inject_cookies_sync(self.ctx); print(Fore.GREEN+"   [OK] Cookies diinject")
         except: pass
         self._current_gql_session, self._gql, self._gql_urls = self._setup_gql(self.pg)
         print(Fore.CYAN+"   [..] Membuka homepage...")
@@ -372,6 +595,10 @@ class FacebookKeywordMonitor:
             if self.context: self.context.close()
             if self.playwright: self.playwright.stop()
         except: pass
+        self.context = None
+        self.page = None
+        self.playwright = None
+        self._warmed_up = False
 
     def _clean_keyword(self,raw): return re.sub(r'site:\s*facebook\s*:\s*','',raw,flags=re.IGNORECASE).strip()
     def _warmup_browser(self,s=10):
@@ -390,6 +617,40 @@ class FacebookKeywordMonitor:
         p=page or self.pg
         try: p.evaluate("()=>{document.querySelectorAll('[aria-label=\"Tutup\"],[aria-label=\"Close\"]').forEach(b=>{if(b.offsetParent!==null)b.click()})}");time.sleep(0.5)
         except: pass
+
+    def _source_metric_label(self, source: str) -> str:
+        source = (source or "").lower()
+        if source == "html_embedded":
+            return "html_fallback"
+        if source in ("dom", "generic", "generic_article", "search_post_card", "page_feed"):
+            return "search_only"
+        if source == "graphql":
+            return "graphql_search"
+        return source or "unknown"
+
+    def _prepare_item_metrics(self, item: dict) -> dict:
+        if not item:
+            return item
+        source_label = self._source_metric_label(item.get("source", ""))
+        item.setdefault("metrics_error", None)
+        if _is_video_item(item):
+            if item.get("metrics_valid") is True:
+                item.setdefault("metric_source", item.get("metric_source") or source_label)
+                item.setdefault("detail_status", item.get("detail_status") or "ok")
+                return item
+            item["metrics_valid"] = False
+            item["metric_source"] = source_label
+            item["detail_status"] = item.get("detail_status") or "pending_detail"
+            item["metrics_unverified"] = True
+            for key in ("likes_count", "comments_count", "views_count", "shares_count"):
+                item[key] = None
+        else:
+            item.setdefault("metrics_valid", True)
+            item.setdefault("metric_source", source_label)
+            item.setdefault("detail_status", "not_required")
+        item["engagement_score"] = _engagement_score(item)
+        assign_viral_fields(item)
+        return item
 
     # ======================================================================
     #  GRAPHQL EXTRACTION
@@ -512,11 +773,12 @@ class FacebookKeywordMonitor:
             elif "/pages/" in url or "/profile.php" in url: pt="pages"
             media_urls=self._find_media_urls(node)
             page_name = actors[0].get("name","") if actors and isinstance(actors,list) and len(actors)>0 and isinstance(actors[0],dict) else ""
-            return {"url":url,"author":author,"text":text[:1000],"caption":text[:1000],"timestamp":ts,"type":pt,
+            item = {"url":url,"author":author,"text":text[:1000],"caption":text[:1000],"timestamp":ts,"type":pt,
                     "likes_count":likes,"comments_count":comments,"views_count":views,"shares_count":shares,
                     "images":media_urls,"media_urls":media_urls,"media_count":len(media_urls),
                     "page_name":page_name,
                     "engagement_score":likes+comments*2+views,"source":"graphql"}
+            return self._prepare_item_metrics(item)
         except: return None
 
     def _find_media_urls(self, data, depth=0):
@@ -653,11 +915,6 @@ class FacebookKeywordMonitor:
             visible = re.sub(r'<[^>]+>', ' ', window)
             visible = html.unescape(visible)
 
-            likes    = self._extract_metric_from_text(visible, ["suka", "likes", "reaksi", "reaction"])
-            comments = self._extract_metric_from_text(visible, ["komentar", "comments", "comment"])
-            views    = self._extract_metric_from_text(visible, ["tayangan", "views", "ditonton", "viewed"])
-            shares   = self._extract_metric_from_text(visible, ["dibagikan", "shares", "share", "bagikan"])
-
             u_lower = url.lower()
             if "/reel/" in u_lower or "/reels/" in u_lower:
                 pt = "videos"
@@ -669,6 +926,18 @@ class FacebookKeywordMonitor:
                 pt = "pages"
             else:
                 pt = "posts"
+
+            if pt == "videos":
+                # Embedded HTML often contains metrics for nearby/other videos.
+                # Keep video metrics empty unless DOM/detail extraction can prove them.
+                likes = comments = views = shares = 0
+                metrics_unverified = True
+            else:
+                likes    = self._extract_metric_from_text(visible, ["suka", "likes", "reaksi", "reaction"])
+                comments = self._extract_metric_from_text(visible, ["komentar", "comments", "comment"])
+                views    = self._extract_metric_from_text(visible, ["tayangan", "views", "ditonton", "viewed"])
+                shares   = self._extract_metric_from_text(visible, ["dibagikan", "shares", "share", "bagikan"])
+                metrics_unverified = False
 
             item = {
                 "url":              url,
@@ -685,9 +954,11 @@ class FacebookKeywordMonitor:
                 "images":           media[:6],
                 "media_urls":       media[:6],
                 "media_count":      len(media[:6]),
-                "engagement_score": likes + comments * 2 + views,
+                "engagement_score": likes + comments * 2 + shares * 3 + views * 0.1,
                 "source":           "html_embedded",
+                "metrics_unverified": metrics_unverified,
             }
+            self._prepare_item_metrics(item)
 
             if keyword and not _keyword_in_item(item, keyword):
                 continue
@@ -794,6 +1065,81 @@ class FacebookKeywordMonitor:
                 else if(sf==='m'||sf==='jt'||sf==='juta'||sf==='mio')n*=1000000;
                 return Math.floor(n)||0;
             };
+            const clean=(text)=>(text||'')
+                .replace(/\u00a0|\xa0|Ã‚|ï¿½/g,' ')
+                .replace(/Facebook(?:\s+Facebook)+/gi,' ')
+                .replace(/Indikator status online Aktif/gi,' ')
+                .replace(/\bIkuti\b/gi,' ')
+                .replace(/\bLihat selengkapnya\b/gi,' ')
+                .replace(/\s+/g,' ')
+                .trim();
+            const cleanCaption=(text)=>{
+                let t=clean(text);
+                t=t.replace(/\b[otdSnpersihualgc0-9.]\s(?:[otdSnpersihualgc0-9.]\s){18,}[A-Za-z0-9.]\b/g,' ');
+                t=t.replace(/\b(?:\d{1,2}:\d{2}\s*\/\s*\d{1,2}:\d{2}(?::\d{2})?)\b/g,' ');
+                t=t.replace(/\s+/g,' ').trim();
+                return t;
+            };
+            const hashText=(text)=>{
+                let h=2166136261;
+                for(const ch of (text||'')){
+                    h^=ch.charCodeAt(0);
+                    h=Math.imul(h,16777619);
+                }
+                return (h>>>0).toString(36);
+            };
+            const isSpecificFbUrl=(url)=>{
+                const u=(url||'').toLowerCase();
+                return /\/share\/(p|v|r)\//.test(u)
+                    || (/\/watch/.test(u)&&/[?&]v=\d+/.test(u))
+                    || /\/groups\/[^/]+\/(posts|permalink)\/\d+/.test(u)
+                    || /\/(posts|permalink)\/(?:\d+|pfbid)/.test(u)
+                    || /\/(videos?|reels?)\/\d+/.test(u)
+                    || /\/photo\/?\?fbid=\d+/.test(u)
+                    || /\/(photo|photos)\/\d+/.test(u)
+                    || /story_fbid=\d+/.test(u);
+            };
+            const pageQuery=()=>{
+                try{return new URLSearchParams(location.search||'').get('q')||'';}catch(e){return '';}
+            };
+            const pickAuthorUrl=(links)=>{
+                for(const a of links){
+                    const h=a.getAttribute('href')||'';
+                    if(!h||h.includes('/stories/')||h.includes('/login')||h.includes('/help'))continue;
+                    if(/facebook\.com\/[a-zA-Z0-9._-]{3,}/.test(h)||/profile\.php\?id=\d+/.test(h))return normalize(h);
+                }
+                return '';
+            };
+            const cleanAuthor=(text)=>{
+                const t=clean(text).slice(0,100);
+                if(!t||t.length<2||/https?:\/\//i.test(t)||/^m\.me$/i.test(t))return '';
+                if(/^[A-Za-z0-9]{6,}\.com$/i.test(t)&&!/(kompas|tempo|detik|cnn|tribun|kumparan|liputan|antara|media|presisi|sumbar|balad)/i.test(t))return '';
+                if(/^[A-Za-z0-9]{10,}$/i.test(t))return '';
+                return t;
+            };
+            const pickAuthorName=(links)=>{
+                for(const a of links){
+                    const h=a.getAttribute('href')||'';
+                    if(!h||h.includes('/stories/')||h.includes('l.facebook.com')||h.includes('m.me')||h.includes('/help')||h.includes('/login'))continue;
+                    if(!(/facebook\.com\/[a-zA-Z0-9._-]{3,}/.test(h)||/profile\.php\?id=\d+/.test(h)))continue;
+                    const name=cleanAuthor(a.innerText||a.getAttribute('aria-label')||'');
+                    if(name)return name;
+                }
+                return '';
+            };
+            const extractLooseMetrics=(text)=>{
+                const matches=[];
+                const re=/(^|[\s·•])([\d.,]+)\s*(rb|ribu|k|jt|juta|m|mio)?(?=\s|$)/ig;
+                let m;
+                while((m=re.exec(text||''))){
+                    const raw=(m[2]||'')+(m[3]?' '+m[3]:'');
+                    const value=parseNum(raw);
+                    if(!value)continue;
+                    if(value>=1900&&value<=2100)continue;
+                    matches.push({raw,value});
+                }
+                return matches;
+            };
             const extractImages=(node)=>{
                 const imgs=[];
                 node.querySelectorAll('img[src*="scontent"],img[src*="fbcdn"]').forEach(im=>{
@@ -876,12 +1222,13 @@ class FacebookKeywordMonitor:
                 try{
                     const ls=c.querySelectorAll('a[href*="/"]');
                     let url=pickContentUrl(ls),author='',txt='';
-                    if(!url||s.has(url))return;
+                    const sourceUrl=url||pickAuthorUrl(ls);
+                    author=pickAuthorName(ls);
                     const ac=c.querySelector('a[role="link"] span[dir="auto"],strong[dir="auto"] > span[dir="auto"],h2 span[dir="auto"],h3 span[dir="auto"],h4 span[dir="auto"]');
-                    if(ac)author=(ac.innerText||'').trim().slice(0,100);
+                    if(!author&&ac)author=cleanAuthor(ac.innerText||'');
                     if(!author){
                         const ac2=c.querySelector('strong[dir="auto"],h2,h3,h4');
-                        if(ac2)author=(ac2.innerText||'').trim().slice(0,100);
+                        if(ac2)author=cleanAuthor(ac2.innerText||'');
                     }
                     c.querySelectorAll('span[dir="auto"],div[dir="auto"]').forEach(el=>{
                         const t=(el.innerText||'').trim();
@@ -889,6 +1236,8 @@ class FacebookKeywordMonitor:
                     });
                     let likes=0,comms=0,views=0,shares=0;
                     const fullText=(c.innerText||'').replace(/\u00a0/g,' ');
+                    txt=cleanCaption(txt);
+                    if(!txt||txt.length<12)txt=cleanCaption(fullText);
                     const vm=fullText.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio)?)\s*(?:tayangan|views|ditonton)/i);
                     if(vm)views=parseNum(vm[0]);
                     c.querySelectorAll('div[role="button"],span[role="button"],a[role="button"]').forEach(el=>{
@@ -916,12 +1265,29 @@ class FacebookKeywordMonitor:
                         const sm=fullText.match(/([\d.,]+\s*(?:rb|ribu|k|jt|juta|m|mio)?)\s*(?:kali\s+dibagikan|x\s+dibagikan|dibagikan|shares?)\b/i);
                         if(sm)shares=parseNum(sm[0]);
                     }
+                    if(!likes&&!comms&&!shares){
+                        const loose=extractLooseMetrics(fullText).slice(-3);
+                        if(loose.length>=2){
+                            likes=loose[0]?.value||0;
+                            comms=loose[1]?.value||0;
+                            shares=loose[2]?.value||0;
+                        }
+                    }
                     const images=extractImages(c);
+                    let source='dom';
+                    if(!url||!isSpecificFbUrl(url)){
+                        if(!txt || txt.length<20 || (!likes&&!comms&&!shares&&!views))return;
+                        const q=pageQuery();
+                        const h=hashText(`${author}|${txt}|${likes}|${comms}|${shares}|${views}`);
+                        url=`https://www.facebook.com/search/posts/?q=${encodeURIComponent(q)}&fb_scrape_card=${h}`;
+                        source='search_post_card';
+                    }
+                    if(!url||s.has(url))return;
                     s.add(url);
                     r.push({url,author:author||'Unknown',text:txt.slice(0,1000),caption:txt.slice(0,1000),
                         timestamp:'',type:'posts',likes_count:likes||0,comments_count:comms||0,
                         views_count:views||0,shares_count:shares||0,images,media_urls:images,media_count:images.length,
-                        engagement_score:likes+comms*2+views,source:'dom'});
+                        engagement_score:likes+comms*2+shares*3+views,source,source_url:sourceUrl||'',matched_via:pageQuery()?`search:${pageQuery()}`:''});
                 }catch(e){}
             });
             return r;
@@ -930,12 +1296,17 @@ class FacebookKeywordMonitor:
 
         for rnd in range(mx):
             if len(results)>=max_items: break
-            batch=page.evaluate(_JS_FEED, max_items-len(results))
+            try:
+                batch=page.evaluate(_JS_FEED, max_items-len(results))
+            except Exception as e:
+                print(Fore.YELLOW+f"   [FEED] stop early, returning {len(results)} partial items: {e}")
+                break
             n=0
             for item in batch:
                 u=item.get('url','')
                 key = _fb_content_key(u) or u
-                if not u or key in seen_urls or not _is_valid_result_url(u): continue
+                if not u or key in seen_urls: continue
+                if item.get("source") != "search_post_card" and not _is_valid_result_url(u): continue
                 if keyword and not _keyword_in_item(item, keyword):
                     continue
                 seen_urls.add(key); results.append(item); n+=1
@@ -943,7 +1314,11 @@ class FacebookKeywordMonitor:
             if n==0: stable+=1
             else: stable=0
             if stable>=ms: break
-            page.evaluate(f"window.scrollBy(0,{random.choice([1200,1500,2000])})")
+            try:
+                page.evaluate(f"window.scrollBy(0,{random.choice([1200,1500,2000])})")
+            except Exception as e:
+                print(Fore.YELLOW+f"   [FEED] scroll interrupted, keeping {len(results)} items: {e}")
+                break
             time.sleep(random.uniform(0.8,1.5))
         return results[:max_items]
 
@@ -1108,15 +1483,6 @@ class FacebookKeywordMonitor:
                         if(cm)comms=parseNum(cm[1]||cm[0]);
                         if(vm)views=parseNum(vm[1]||vm[0]);
                         if(sm)shares=parseNum(sm[1]||sm[0]);
-                        if(!likes&&!comms&&!views){
-                            const nums=metricNums(fullText).filter(n=>n>9);
-                            if(nums.length>=3){
-                                const tail=nums.slice(-3);
-                                likes=tail[0]; comms=tail[1]; views=tail[2];
-                            }else if(nums.length>=2){
-                                likes=nums[0]; comms=nums[1];
-                            }
-                        }
                         const images=extractImages(card);
                         s.add(url);
                         r.push({url,author:author||'Unknown',text:caption,caption,
@@ -1249,7 +1615,11 @@ class FacebookKeywordMonitor:
 
         for rnd in range(mx):
             if len(results)>=max_items: break
-            batch=page.evaluate(_JS_GENERIC, {"searchType": search_type, "keyword": keyword or ''})
+            try:
+                batch=page.evaluate(_JS_GENERIC, {"searchType": search_type, "keyword": keyword or ''})
+            except Exception as e:
+                print(Fore.YELLOW+f"   [GENERIC] stop early, returning {len(results)} partial items: {e}")
+                break
             n=0
             for item in batch:
                 u=item.get('url','')
@@ -1274,7 +1644,11 @@ class FacebookKeywordMonitor:
             if n==0: stable+=1
             else: stable=0
             if stable>=ms: break
-            page.evaluate(f"window.scrollBy(0,{random.choice([1000,1500,2000])})")
+            try:
+                page.evaluate(f"window.scrollBy(0,{random.choice([1000,1500,2000])})")
+            except Exception as e:
+                print(Fore.YELLOW+f"   [GENERIC] scroll interrupted, keeping {len(results)} items: {e}")
+                break
             time.sleep(random.uniform(0.8,1.5))
         return results[:max_items]
 
@@ -1284,17 +1658,204 @@ class FacebookKeywordMonitor:
             return False
         text_missing = not (item.get("caption") or item.get("text") or "").strip()
         core_missing = (
-            item.get("likes_count", 0) == 0
-            or item.get("comments_count", 0) == 0
-            or item.get("shares_count", 0) == 0
+            _metric_value(item.get("likes_count")) == 0
+            or _metric_value(item.get("comments_count")) == 0
+            or _metric_value(item.get("shares_count")) == 0
         )
-        is_video = (item.get("type", "").lower() in ("videos", "video", "reel", "reels")
-                    or any(x in url.lower() for x in ("/watch", "/reel/", "/reels/", "/videos/", "/share/v/")))
-        return text_missing or (is_video and core_missing) or (
-            item.get("likes_count", 0) == 0
-            and item.get("comments_count", 0) == 0
-            and item.get("shares_count", 0) == 0
+        is_video = _is_video_item(item)
+        return text_missing or (is_video and not item.get("metrics_valid")) or (is_video and core_missing) or (
+            _metric_value(item.get("likes_count")) == 0
+            and _metric_value(item.get("comments_count")) == 0
+            and _metric_value(item.get("shares_count")) == 0
         )
+
+    def safe_goto(self, page: Page, url: str, timeout=45000, retries=3) -> dict:
+        last_error = None
+        for attempt in range(1, retries + 1):
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                return {"ok": True, "status": "loaded", "final_url": page.url, "error": None}
+            except Exception as e:
+                last_error = str(e)
+                final_url = getattr(page, "url", "") or ""
+                if "net::ERR_ABORTED" in last_error and "facebook.com" in final_url and final_url != "about:blank":
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    except Exception:
+                        pass
+                    return {"ok": True, "status": "loaded_after_abort", "final_url": final_url, "error": last_error}
+                print(Fore.YELLOW+f"     [DETAIL] goto retry {attempt}/{retries}: {last_error[:180]}")
+                try:
+                    page.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
+                time.sleep(min(1.5 * attempt, 4.0))
+        return {"ok": False, "status": "navigation_failed", "final_url": getattr(page, "url", "") or "", "error": last_error}
+
+    def _save_detail_debug_snapshot(self, url: str, page: Optional[Page], error: str):
+        try:
+            os.makedirs("fb_keyword_debug", exist_ok=True)
+            final_url = ""
+            body = ""
+            if page is not None:
+                try:
+                    final_url = page.url
+                except Exception:
+                    final_url = ""
+                try:
+                    body = page.locator("body").inner_text(timeout=3000)
+                except Exception:
+                    body = ""
+            payload = {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "url": url,
+                "final_url": final_url,
+                "body_text": (body or "")[:5000],
+                "error": str(error or "")[:2000],
+            }
+            name = f"detail_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.json"
+            with open(os.path.join("fb_keyword_debug", name), "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as snap_err:
+            print(Fore.YELLOW+f"     [DETAIL] debug snapshot failed: {snap_err}")
+
+    def collect_metric_text_candidates(self, page: Page) -> List[str]:
+        try:
+            return page.evaluate(r"""
+            () => {
+                const metricRe = /(tayangan|views?|ditonton|viewed|komentar|comments?|suka|likes?|reaksi|reactions?|dibagikan|shares?)/i;
+                const clean = (text) => (text || '')
+                    .replace(/\u00a0|\xa0|Ã‚|ï¿½/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                const seen = new Set();
+                const out = [];
+                const add = (text) => {
+                    const value = clean(text);
+                    if (!value || seen.has(value)) return;
+                    seen.add(value);
+                    out.push(value);
+                };
+
+                add(document.body?.innerText || '');
+                const bodyLines = (document.body?.innerText || '').split(/\n+/).map(clean).filter(Boolean);
+                bodyLines.forEach((line, idx) => {
+                    if (!metricRe.test(line)) return;
+                    add(line);
+                    if (idx > 0) add(`${bodyLines[idx - 1]} ${line}`);
+                    if (idx + 1 < bodyLines.length) add(`${line} ${bodyLines[idx + 1]}`);
+                    if (idx > 0 && idx + 1 < bodyLines.length) add(`${bodyLines[idx - 1]} ${line} ${bodyLines[idx + 1]}`);
+                });
+
+                document.querySelectorAll('[aria-label]').forEach(el => {
+                    const aria = clean(el.getAttribute('aria-label') || '');
+                    if (metricRe.test(aria)) add(aria);
+                });
+
+                document.querySelectorAll('[role="button"]').forEach(el => {
+                    const text = clean(`${el.getAttribute('aria-label') || ''} ${el.innerText || ''}`);
+                    if (metricRe.test(text)) add(text);
+                });
+
+                document.querySelectorAll('span,div').forEach(el => {
+                    const text = clean(el.innerText || el.textContent || '');
+                    if (!text || text.length > 260) return;
+                    if (metricRe.test(text)) add(text);
+                });
+
+                return out.slice(0, 500);
+            }
+            """)
+        except Exception as e:
+            print(Fore.YELLOW+f"     [DETAIL] candidate collect error: {e}")
+            try:
+                return [page.locator("body").inner_text(timeout=3000)]
+            except Exception:
+                return []
+
+    def extract_detail_metrics(self, page: Page, url: str) -> dict:
+        nav = self.safe_goto(page, url, timeout=45000, retries=3)
+        out = {
+            "likes_count": None,
+            "comments_count": None,
+            "shares_count": None,
+            "views_count": None,
+            "metrics_valid": False,
+            "metric_source": "detail_page_text",
+            "metrics_error": None,
+            "detail_status": nav.get("status") or "unknown",
+            "detail_final_url": nav.get("final_url") or "",
+            "matched_patterns": {},
+        }
+        if not nav.get("ok"):
+            out["metrics_error"] = nav.get("error") or "navigation_failed"
+            self._save_detail_debug_snapshot(url, page, out["metrics_error"])
+            return out
+        try:
+            time.sleep(random.uniform(3.0, 5.0))
+            self._close_popups(page)
+            try:
+                page.evaluate("window.scrollBy(0, 650)")
+                time.sleep(0.8)
+                page.evaluate("window.scrollBy(0, -220)")
+                time.sleep(0.4)
+            except Exception:
+                pass
+            try:
+                body_text_for_footer = page.locator("body").inner_text(timeout=3000)
+            except Exception:
+                body_text_for_footer = ""
+            candidates = self.collect_metric_text_candidates(page)
+            metrics = {
+                "views": None,
+                "likes": None,
+                "comments": None,
+                "shares": None,
+                "matched_patterns": {},
+            }
+            for candidate in candidates:
+                found = extract_video_metrics_from_text(candidate)
+                for field in ("views", "likes", "comments", "shares"):
+                    value = found.get(field)
+                    if value is None:
+                        continue
+                    if metrics[field] is None or value > metrics[field]:
+                        metrics[field] = value
+                        metrics["matched_patterns"][field] = found.get("matched_patterns", {}).get(field, "")[:160]
+            mapping = {
+                "likes": "likes_count",
+                "comments": "comments_count",
+                "shares": "shares_count",
+                "views": "views_count",
+            }
+            for src, dst in mapping.items():
+                if metrics.get(src) is not None:
+                    out[dst] = metrics[src]
+            out["matched_patterns"] = metrics.get("matched_patterns", {})
+            footer_metrics = extract_reel_footer_metrics_from_text(body_text_for_footer)
+            footer_used = False
+            for key in ("likes_count", "comments_count", "shares_count", "views_count"):
+                val = footer_metrics.get(key)
+                if val is not None and out.get(key) is None:
+                    out[key] = int(val)
+                    footer_used = True
+                    pattern = footer_metrics.get("matched_patterns", {}).get(key)
+                    if pattern:
+                        out["matched_patterns"][key] = pattern
+            if footer_used and not metrics.get("matched_patterns"):
+                out["metric_source"] = "detail_page_reel_footer"
+            out["metrics_valid"] = any(out.get(k) is not None for k in ("likes_count", "comments_count", "shares_count", "views_count"))
+            if out["metrics_valid"]:
+                out["detail_status"] = "ok"
+            else:
+                out["metrics_error"] = "no_detail_metric_pattern_matched"
+                self._save_detail_debug_snapshot(url, page, out["metrics_error"])
+            return out
+        except Exception as e:
+            out["metrics_error"] = str(e)[:1000]
+            out["detail_status"] = "extract_failed"
+            self._save_detail_debug_snapshot(url, page, out["metrics_error"])
+            return out
 
     def _extract_detail_metadata(self, page: Page) -> dict:
         try:
@@ -1319,6 +1880,7 @@ class FacebookKeywordMonitor:
                         .filter(n => n > 0);
                 };
                 const maxMetric = (current, text) => Math.max(current || 0, parseNum(text));
+                const hasMetricNumber = (text) => /[\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?/i.test(clean(text));
                 const bodyText = clean(document.body.innerText || '');
                 const metricNumber = /^(\d+(?:[.,]\d+)?\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?|\d+)$/i;
                 const scopedText = () => {
@@ -1345,71 +1907,46 @@ class FacebookKeywordMonitor:
                     const aria = clean(el.getAttribute('aria-label') || '');
                     const text = clean(el.innerText || '');
                     const combined = `${aria} ${text}`;
-                    if (/suka|like|reaction|reaksi/i.test(combined)) out.likes_count = maxMetric(out.likes_count, combined);
-                    if (/komentar|comment/i.test(combined)) out.comments_count = maxMetric(out.comments_count, combined);
-                    if (/bagikan|share|kirim/i.test(combined)) out.shares_count = maxMetric(out.shares_count, combined);
-                    if (/tayangan|views|ditonton|viewed/i.test(combined)) out.views_count = maxMetric(out.views_count, combined);
+                    if (/suka|like|reaction|reaksi/i.test(combined) && hasMetricNumber(combined)) out.likes_count = maxMetric(out.likes_count, combined);
+                    if (/komentar|comment/i.test(combined) && hasMetricNumber(combined) && !/komentar oleh|comment by|beri komentar|write a comment|tulis komentar/i.test(combined)) out.comments_count = maxMetric(out.comments_count, combined);
+                    if (/bagikan|share|kirim/i.test(combined) && hasMetricNumber(combined)) out.shares_count = maxMetric(out.shares_count, combined);
+                    if (/tayangan|views|ditonton|viewed/i.test(combined) && hasMetricNumber(combined)) out.views_count = maxMetric(out.views_count, combined);
                 });
 
-                const inferVideoViewsFromEngagementRow = () => {
-                    const lines = scopedText().split(/\n+/).map(clean).filter(Boolean);
-                    const actionIdx = lines.findIndex(line => /^(suka|like)$/i.test(line));
-                    if (actionIdx <= 0) return 0;
-                    const nums = [];
-                    for (let i = Math.max(0, actionIdx - 10); i < actionIdx; i++) {
-                        const line = lines[i];
-                        if (metricNumber.test(line) && !/^\d{1,2}:\d{2}(?::\d{2})?$/.test(line)) {
-                            nums.push(line);
-                        }
-                    }
-                    if (nums.length >= 3) return parseNum(nums[nums.length - 1]);
-                    if (nums.length >= 2 && /(rb|ribu|k|jt|juta|mio|mn)\b/i.test(nums[nums.length - 1])) {
-                        return parseNum(nums[nums.length - 1]);
-                    }
-                    return 0;
-                };
                 const inferVideoEngagementRow = () => {
                     const text = scopedText();
-                    const actionMatch = text.match(/([\s\S]{0,500}?)(?:\bSuka\b|\bLike\b)\s+(?:Komentari|Comment)\s+(?:Bagikan|Share)\b/i);
-                    if (!actionMatch) return;
-                    const nums = parseNums(actionMatch[1]).filter(n => n < 1000000000);
-                    if (nums.length < 2) return;
-                    const isVideo = /\/(?:videos?|watch|reels?|reel)\b/i.test(location.pathname + location.search);
-                    if (isVideo && nums.length >= 3) {
-                        const [likes, comments, views] = nums.slice(-3);
-                        out.likes_count = Math.max(out.likes_count, likes);
-                        out.comments_count = Math.max(out.comments_count, comments);
-                        out.views_count = Math.max(out.views_count, views);
-                    } else if (nums.length >= 3) {
-                        const [likes, comments, shares] = nums.slice(-3);
-                        out.likes_count = Math.max(out.likes_count, likes);
-                        out.comments_count = Math.max(out.comments_count, comments);
-                        out.shares_count = Math.max(out.shares_count, shares);
-                    } else {
-                        const [likes, comments] = nums.slice(-2);
-                        out.likes_count = Math.max(out.likes_count, likes);
-                        out.comments_count = Math.max(out.comments_count, comments);
+                    const primaryRow = text.match(/(?:\bSuka\b|\bLike\b)\s+(?:Komentari|Comment)\s+(?:Bagikan|Share)\s+([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:[^\w\d]+)\s*([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:komentar|comments?)\s*(?:[^\w\d]+)\s*([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:tayangan|views?|ditonton|viewed)/i);
+                    if (primaryRow) {
+                        out.likes_count = parseNum(primaryRow[1]) || out.likes_count;
+                        out.comments_count = parseNum(primaryRow[2]) || out.comments_count;
+                        out.views_count = parseNum(primaryRow[3]) || out.views_count;
+                        return;
+                    }
+                    const primaryRowNoLikes = text.match(/(?:\bSuka\b|\bLike\b)\s+(?:Komentari|Comment)\s+(?:Bagikan|Share)\s*(?:[^\w\d]+)\s*([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:komentar|comments?)\s*(?:[^\w\d]+)\s*([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:tayangan|views?|ditonton|viewed)/i);
+                    if (primaryRowNoLikes) {
+                        out.comments_count = parseNum(primaryRowNoLikes[1]) || out.comments_count;
+                        out.views_count = parseNum(primaryRowNoLikes[2]) || out.views_count;
+                        return;
                     }
                 };
 
-                out.likes_count = out.likes_count || scanMetric([
+                out.likes_count = Math.max(out.likes_count, scanMetric([
                     /([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:suka|likes?|reaksi|reactions?)/i,
                     /(?:suka|likes?|reaksi|reactions?)\s*[:\-]?\s*([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)/i,
-                ]);
-                out.comments_count = out.comments_count || scanMetric([
+                ]));
+                out.comments_count = Math.max(out.comments_count, scanMetric([
                     /([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:komentar|comments?)/i,
                     /(?:komentar|comments?)\s*[:\-]?\s*([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)/i,
-                ]);
-                out.shares_count = out.shares_count || scanMetric([
+                ]));
+                out.shares_count = Math.max(out.shares_count, scanMetric([
                     /([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:kali\s+dibagikan|x\s+dibagikan|dibagikan|shares?)/i,
                     /(?:dibagikan|shares?)\s*[:\-]?\s*([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)/i,
-                ]);
-                out.views_count = out.views_count || scanMetric([
+                ]));
+                out.views_count = Math.max(out.views_count, scanMetric([
                     /([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:tayangan|views?|ditonton|viewed)/i,
                     /(?:tayangan|views?|ditonton|viewed)\s*[:\-]?\s*([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)/i,
-                ]);
+                ]));
                 inferVideoEngagementRow();
-                out.views_count = Math.max(inferVideoViewsFromEngagementRow(), out.views_count);
 
                 const chrome = /(notifikasi|belum dibaca|lihat semua|orang yang anda kenal|saran teman|selamat datang|welcome to facebook|masuk ke facebook|log in to facebook|filter|hasil pencarian|tanggal diposting|marketplace|halaman|grup|acara)/i;
                 const metricish = /^([\d.,]+\s*(rb|ribu|k|jt|juta|m|mio|mn)?|[\d:]+|suka|komentar|bagikan|share|like|comment)$/i;
@@ -1460,10 +1997,8 @@ class FacebookKeywordMonitor:
 
         def _detail_priority(item: dict):
             url = (item.get("url") or "").lower()
-            is_video = item.get("type", "").lower() in ("videos", "video", "reel", "reels") or any(
-                x in url for x in ("/watch", "/reel/", "/reels/", "/videos/", "/share/v/")
-            )
-            incomplete = int(item.get("shares_count", 0) or 0) == 0 or int(item.get("views_count", 0) or 0) == 0
+            is_video = _is_video_item(item)
+            incomplete = _metric_value(item.get("shares_count")) == 0 or _metric_value(item.get("views_count")) == 0 or not item.get("metrics_valid")
             return (1 if is_video else 0, 1 if incomplete else 0, _engagement_score(item))
 
         targets = [p for p in posts if self._needs_detail_enrich(p)]
@@ -1480,27 +2015,62 @@ class FacebookKeywordMonitor:
                     progress_callback(f"Detail metadata {idx}/{len(targets)}")
                 try:
                     print(Fore.CYAN+f"     [DETAIL] {idx}/{len(targets)} {url[:70]}...")
-                    tab.goto(url, wait_until="domcontentloaded", timeout=18000)
-                    time.sleep(random.uniform(FB_DETAIL_WAIT_SECONDS, FB_DETAIL_WAIT_SECONDS + 0.6))
-                    self._close_popups(tab)
-                    try:
-                        tab.evaluate("window.scrollBy(0, 500)")
-                        time.sleep(0.4)
-                    except Exception:
-                        pass
+                    is_video = _is_video_item(post)
+                    detail_metrics = None
+                    if is_video:
+                        detail_metrics = self.extract_detail_metrics(tab, url)
+                        post["detail_status"] = detail_metrics.get("detail_status") or "unknown"
+                        post["metrics_error"] = detail_metrics.get("metrics_error")
+                        post["detail_final_url"] = detail_metrics.get("detail_final_url")
+                        if detail_metrics.get("metrics_valid"):
+                            for src_key, dst_key in [
+                                ("likes_count", "likes_count"),
+                                ("comments_count", "comments_count"),
+                                ("shares_count", "shares_count"),
+                                ("views_count", "views_count"),
+                            ]:
+                                val = detail_metrics.get(src_key)
+                                if val is not None:
+                                    post[dst_key] = int(val)
+                            post["metrics_valid"] = True
+                            post["metrics_unverified"] = False
+                            post["metric_source"] = detail_metrics.get("metric_source") or "detail_page_text"
+                            post["metric_patterns"] = detail_metrics.get("matched_patterns", {})
+                        else:
+                            post["metrics_valid"] = False
+                            post["metric_source"] = detail_metrics.get("metric_source") or post.get("metric_source") or "detail_page_text"
+                    else:
+                        nav = self.safe_goto(tab, url, timeout=45000, retries=3)
+                        post["detail_status"] = nav.get("status") or "unknown"
+                        if not nav.get("ok"):
+                            raise RuntimeError(nav.get("error") or "navigation_failed")
+                        time.sleep(random.uniform(FB_DETAIL_WAIT_SECONDS, FB_DETAIL_WAIT_SECONDS + 0.6))
+                        self._close_popups(tab)
+                        try:
+                            tab.evaluate("window.scrollBy(0, 500)")
+                            time.sleep(0.4)
+                        except Exception:
+                            pass
                     meta = self._extract_detail_metadata(tab)
-                    for src_key, dst_key in [
-                        ("likes_count", "likes_count"),
-                        ("comments_count", "comments_count"),
-                        ("shares_count", "shares_count"),
-                        ("views_count", "views_count"),
-                    ]:
-                        val = int(meta.get(src_key, 0) or 0)
-                        if dst_key == "views_count" and val > 0:
-                            # Detail/permalink view count is more trustworthy than search-card text.
-                            post[dst_key] = val
-                        elif val > int(post.get(dst_key, 0) or 0):
-                            post[dst_key] = val
+                    if not is_video:
+                        for src_key, dst_key in [
+                            ("likes_count", "likes_count"),
+                            ("comments_count", "comments_count"),
+                            ("shares_count", "shares_count"),
+                            ("views_count", "views_count"),
+                        ]:
+                            val = int(meta.get(src_key, 0) or 0)
+                            if dst_key == "views_count" and val > 0:
+                                has_detail_engagement = any(int(meta.get(k, 0) or 0) > 0 for k in ("likes_count", "comments_count", "shares_count"))
+                                has_existing_engagement = any(_metric_value(post.get(k)) > 0 for k in ("likes_count", "comments_count", "shares_count"))
+                                if has_detail_engagement or has_existing_engagement:
+                                    post[dst_key] = val
+                            elif val > _metric_value(post.get(dst_key)):
+                                post[dst_key] = val
+                        if any(int(meta.get(k, 0) or 0) > 0 for k in ("likes_count", "comments_count", "shares_count", "views_count")):
+                            post["metrics_valid"] = True
+                            post["metrics_unverified"] = False
+                            post["metric_source"] = "detail_page"
                     caption = (meta.get("caption") or "").strip()
                     current = (post.get("caption") or post.get("text") or "").strip()
                     if caption and (not current or len(caption) > len(current)):
@@ -1511,10 +2081,19 @@ class FacebookKeywordMonitor:
                     if author and (current_author in ("", "Unknown") or re.match(r"^\d{1,2}:\d{2}(?::\d{2})?$", current_author)):
                         post["author"] = author[:100]
                     post["engagement_score"] = _engagement_score(post)
+                    assign_viral_fields(post)
                     post["detail_enriched"] = True
                 except Exception as e:
                     print(Fore.YELLOW+f"     [DETAIL] skip: {e}")
                     post["detail_enrich_failed"] = True
+                    post["detail_status"] = "detail_failed"
+                    post["metrics_error"] = str(e)[:1000]
+                    if _is_video_item(post):
+                        post["metrics_valid"] = False
+                        for key in ("likes_count", "comments_count", "views_count", "shares_count"):
+                            if post.get(key) == 0:
+                                post[key] = None
+                        self._save_detail_debug_snapshot(url, tab, str(e))
         finally:
             try:
                 tab.close()
@@ -1842,22 +2421,44 @@ class FacebookKeywordMonitor:
         try:
             # ✅ FIX: Setup GQL interceptor SEBELUM goto agar tidak miss responses
             gql_sid, gql_data, gql_urls = self._setup_gql(p)
-            p.goto(url,wait_until="domcontentloaded",timeout=30000)
+            last_nav_error = None
+            for attempt in range(2):
+                try:
+                    p.goto(url,wait_until="domcontentloaded",timeout=30000)
+                    last_nav_error = None
+                    break
+                except Exception as nav_err:
+                    last_nav_error = nav_err
+                    print(Fore.YELLOW+f"   [NAV] retry {attempt+1}/2 after navigation error: {nav_err}")
+                    try:
+                        p.goto("about:blank",wait_until="domcontentloaded",timeout=5000)
+                    except Exception:
+                        pass
+                    time.sleep(1.0)
+            if last_nav_error:
+                raise last_nav_error
             # ✅ FIX: Tambah wait lebih lama agar GQL sempat di-intercept
             time.sleep(FB_SEARCH_LOAD_SECONDS)
             self._close_popups(p)
             # ✅ FIX: Scroll beberapa kali untuk trigger lazy load GQL
             for _ in range(max(0, FB_SEARCH_PRE_SCROLLS)):
-                p.evaluate("window.scrollBy(0, 800)")
+                try:
+                    p.evaluate("window.scrollBy(0, 800)")
+                except Exception as e:
+                    print(Fore.YELLOW+f"   [NAV] pre-scroll interrupted: {e}")
+                    break
                 time.sleep(FB_SEARCH_SCROLL_DELAY)
             time.sleep(min(0.3, FB_SEARCH_SCROLL_DELAY))
             if search_type == "posts":
                 for item in self._extract_feed(p,max_results,keyword):
+                    self._prepare_item_metrics(item)
                     u=item.get('url','')
                     key=_fb_content_key(u) or u
-                    if u and key not in seen_urls and _is_valid_result_url(u): seen_urls.add(key); all_results.append(item)
+                    if u and key not in seen_urls and (item.get("source") == "search_post_card" or _is_valid_result_url(u)):
+                        seen_urls.add(key); all_results.append(item)
             else:
                 for item in self._extract_generic(p,max_results,search_type,keyword):
+                    self._prepare_item_metrics(item)
                     u=item.get('url','')
                     key=_fb_content_key(u) or u
                     if u and key not in seen_urls and _is_valid_result_url(u): seen_urls.add(key); all_results.append(item)
@@ -1865,6 +2466,7 @@ class FacebookKeywordMonitor:
             if len(all_results) < max_results:
                 print(Fore.YELLOW+f"   [GQL-FALLBACK] Trying GraphQL ({len(gql_data)} responses)...")
                 for item in self._extract_gql(gql_data,keyword,strict_keyword):
+                    self._prepare_item_metrics(item)
                     u=item.get('url','')
                     key=_fb_content_key(u) or u
                     if u and key not in seen_urls and _is_valid_result_url(u): seen_urls.add(key); all_results.append(item)
@@ -1872,6 +2474,7 @@ class FacebookKeywordMonitor:
             if not all_results:
                 print(Fore.YELLOW+"   [HTML-FALLBACK] Parsing embedded page JSON/HTML...")
                 for item in self._extract_embedded_html(p, max_results, "", search_type):
+                    self._prepare_item_metrics(item)
                     u=item.get('url','')
                     key=_fb_content_key(u) or u
                     if u and key not in seen_urls and _is_valid_result_url(u):
@@ -1900,7 +2503,7 @@ class FacebookKeywordMonitor:
                     for item in self._scrape_search_url(url,keyword,per_type,st,page=tab):
                         u=item.get('url','')
                         key=_fb_content_key(u) or u
-                        if u and key not in seen_urls and _is_valid_result_url(u):
+                        if u and key not in seen_urls and (item.get("source") == "search_post_card" or _is_valid_result_url(u)):
                             seen_urls.add(key);item["deep_source_type"]="reels" if "/search/reels/" in url else st;all_results.append(item)
                 print(Fore.GREEN+f"   [OK] {st}: {len(all_results)} items total")
             except Exception as e: print(Fore.RED+f"   [FAIL] {st}: {e}")
@@ -2129,7 +2732,7 @@ class FacebookKeywordMonitor:
                 except: pass
         return posts
 
-    def scrape_keyword(self,raw_keyword,max_results=1000,types=None,sort_by="engagement",
+    def scrape_keyword(self,raw_keyword,max_results=1000,types=None,sort_by="trending",
                        min_likes=None,min_comments=None,min_views=None,
                        max_comments_per_post=0,top_comments_count=10,progress_callback=None,
                        detail_enrich_limit=None):
@@ -2165,24 +2768,38 @@ class FacebookKeywordMonitor:
         return {"keyword":keyword,"scraped_at":datetime.now().isoformat(),"types":types,
                 "total_results":len(all_results),"results":all_results,"sort_by":sort_by,"success":True}
 
-    def scrape_hashtag(self,hashtag,max_results=1000,sort_by="engagement",
+    def scrape_hashtag(self,hashtag,max_results=1000,sort_by="trending",types=None,
                        min_likes=None,min_comments=None,min_views=None,
                        max_comments_per_post=0,top_comments_count=10,progress_callback=None,
                        detail_enrich_limit=None):
+        if types is None: types=['posts','videos']
         tag=hashtag.lstrip('#').strip()
         print(Fore.CYAN+f"\n[HASHTAG] #{tag}")
         self.initialize_browser()
         step_a=[]
-        try:
-            for item in self._scrape_search_url(f"https://www.facebook.com/hashtag/{quote(tag)}",tag,max_results,"posts",strict_keyword=True):
-                item["matched_via"]="hashtag_page"; step_a.append(item)
-        except: pass
+        active_types=set(types or ['posts','videos'])
+        if "posts" in active_types:
+            try:
+                for item in self._scrape_search_url(f"https://www.facebook.com/hashtag/{quote(tag)}",tag,max_results,"posts",strict_keyword=True):
+                    item["matched_via"]="hashtag_page"; step_a.append(item)
+            except: pass
         all_results=list(step_a)
-        if len(all_results)<5:
+        if "posts" in active_types and len(all_results)<5:
             try:
                 for item in self._scrape_search_url(f"https://www.facebook.com/search/posts/?q={quote(tag)}",tag,max_results-len(all_results),"posts",strict_keyword=True):
                     item["matched_via"]="keyword_fallback"
-                    if _is_valid_result_url(item.get("url","")) and item.get("url","") not in [x.get("url","") for x in all_results]: all_results.append(item)
+                    if (item.get("source") == "search_post_card" or _is_valid_result_url(item.get("url",""))) and item.get("url","") not in [x.get("url","") for x in all_results]: all_results.append(item)
+            except: pass
+        if "videos" in active_types and len(all_results)<max_results:
+            try:
+                existing={_fb_content_key(x.get("url","")) or x.get("url","") for x in all_results}
+                remaining=max_results-len(all_results)
+                for item in self._scrape_search_url(f"https://www.facebook.com/search/videos/?q={quote(tag)}",tag,remaining,"videos",strict_keyword=True):
+                    item["matched_via"]="hashtag_video_fallback"
+                    u=item.get("url","")
+                    key=_fb_content_key(u) or u
+                    if u and key not in existing and _is_valid_result_url(u):
+                        existing.add(key); all_results.append(item)
             except: pass
         self.enrich_missing_details(
             all_results,
@@ -2210,7 +2827,7 @@ class FacebookKeywordMonitor:
                                     "keyword_fallback":sum(1 for x in all_results if x.get("matched_via")=="keyword_fallback")},
                 "success":True}
 
-    def scrape_trending(self,max_results=1000,sort_by="engagement",keyword="",
+    def scrape_trending(self,max_results=1000,sort_by="trending",keyword="",
                        types=None,min_likes=None,min_comments=None,min_views=None,
                        max_comments_per_post=0,top_comments_count=10,progress_callback=None,
                        detail_enrich_limit=None):

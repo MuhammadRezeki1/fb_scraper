@@ -139,6 +139,8 @@ export default function PostScraperPage() {
 
   const isPostUrl = (url: string) => {
     if (!url.includes("facebook.com") && !url.includes("fb.com")) return false;
+    // Tolak URL hasil pencarian / placeholder kartu deep-search (tanpa permalink asli)
+    if (/fb_scrape_card=/i.test(url) || /facebook\.com\/search\//i.test(url)) return false;
     return !(/facebook\.com\/[^/?#]+\/?(\?[^#]*)?$/.test(url) &&
       !/\/(posts|videos|photo|photos|reel|reels|share|permalink|watch|story|video)\//i.test(url) &&
       !/[?&](v|story_fbid|fbid)=/i.test(url));

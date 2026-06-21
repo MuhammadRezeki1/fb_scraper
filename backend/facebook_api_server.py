@@ -38,9 +38,19 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from colorama import Fore, init
+from browser_runtime import browser_channel_kwargs
 
 app = Flask(__name__)
-CORS(app)
+
+
+def _env_csv(name: str) -> list[str]:
+    return [value.strip() for value in os.getenv(name, "").split(",") if value.strip()]
+
+
+_cors_origins = _env_csv("FRONTEND_URL") + _env_csv("CORS_ORIGINS")
+if _cors_origins:
+    CORS(app, resources={r"/api/*": {"origins": _cors_origins}})
+
 init(autoreset=True)
 # Register blueprint deep search
 app.register_blueprint(deep_search_bp)
@@ -351,7 +361,7 @@ def run_login_browser_async(timeout_minutes: int = 5, headless: bool = False):
                 async with async_playwright() as p:
                     context = await p.chromium.launch_persistent_context(
                         FB_CHROME_PROFILE,
-                        channel="chrome",
+                        **browser_channel_kwargs(),
                         headless=headless,
                         args=[
                             "--start-maximized",
@@ -863,11 +873,21 @@ def logout():
 def scrape_single_post():
     data            = request.get_json(silent=True) or {}
     url             = clean_fb_url(data.get("url", ""))
-    max_comments    = int(data.get("max_comments", 200))
+    # Tolak URL placeholder kartu deep-search / halaman pencarian — bukan permalink
+    # post asli, jadi detail (caption/komentar) tidak akan bisa di-scrape.
+    _url_lc = url.lower()
+    if "fb_scrape_card=" in _url_lc or "/search/" in _url_lc:
+        return error_response(
+            "URL ini bukan permalink post. Post ini ditangkap dari kartu pencarian "
+            "deep-search dan Facebook tidak mengekspos link aslinya, sehingga detailnya "
+            "tidak bisa di-scrape. Gunakan URL post langsung (mis. .../posts/..., /reel/..., /watch/?v=...).",
+            400,
+        )
+    max_comments    = max(0, int(data.get("max_comments", 200)))
     include_replies = bool(data.get("include_replies", True))
     scrape_reactors = bool(data.get("scrape_reactors", False))
     max_reactors    = max(0, min(int(data.get("max_reactors", 200) or 200), 5000))
-    if data.get("all_comments") or max_comments <= 0:
+    if data.get("all_comments"):
         max_comments = 1_000_000
 
     def work():

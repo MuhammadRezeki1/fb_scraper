@@ -55,6 +55,21 @@ def _fast_types(types: list) -> list:
     return filtered or ["posts", "videos"]
 
 
+def _mix_types(types: list, mix: dict) -> list:
+    existing = list(dict.fromkeys(types or ["posts", "videos"]))
+    if mix["mode"] == "posts_only":
+        return [t for t in existing if t != "videos"] or ["posts"]
+    if mix["mode"] == "videos_only":
+        return ["videos"]
+    ordered = []
+    if "posts" in existing:
+        ordered.append("posts")
+    ordered.extend(t for t in existing if t not in {"posts", "videos"})
+    if "videos" in existing:
+        ordered.append("videos")
+    return ordered or ["posts", "videos"]
+
+
 # ── Status konstanta ────────────────────────────────────────────────────────
 class JobStatus:
     PENDING   = "pending"
@@ -131,30 +146,253 @@ def _update_state(job_id: str, **kwargs):
 
 
 # ── Sort/Filter helpers (v3) ──────────────────────────────────────────────
+def _metric_value(value) -> int:
+    try:
+        if value is None:
+            return 0
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
 def _engagement_score(item: dict) -> float:
     return (
-        item.get("likes_count", 0) +
-        item.get("comments_count", 0) * 2 +
-        item.get("shares_count", 0) * 3 +
-        item.get("views_count", 0) * 0.1
+        _metric_value(item.get("likes_count")) +
+        _metric_value(item.get("comments_count")) * 2 +
+        _metric_value(item.get("shares_count")) * 3 +
+        _metric_value(item.get("views_count")) * 0.1
     )
+
+
+VIRAL_LEVEL_ORDER = {
+    "unknown": 0,
+    "low": 1,
+    "potential": 2,
+    "viral": 3,
+    "strong_viral": 4,
+    "very_viral": 5,
+}
+
+
+def _is_video_result(item: dict) -> bool:
+    typ = (item.get("type") or "").lower()
+    url = (item.get("url") or "").lower()
+    return typ in {"videos", "video", "reel", "reels", "watch"} or any(
+        x in url for x in ("/watch", "/reel/", "/reels/", "/videos/", "/video/", "/share/v/")
+    )
+
+
+def _is_metric_empty(item: dict) -> bool:
+    return not any(
+        _metric_value(item.get(key)) > 0
+        for key in ("likes_count", "comments_count", "shares_count", "views_count")
+    )
+
+
+def _content_priority(item: dict) -> int:
+    if not _is_video_result(item):
+        return 1
+    if item.get("metrics_valid") is True:
+        return 2
+    return 3 if not _is_metric_empty(item) else 4
+
+
+def _count_videos(items: list) -> int:
+    return sum(1 for item in items if _is_video_result(item))
+
+
+def _count_non_videos(items: list) -> int:
+    return sum(1 for item in items if not _is_video_result(item))
+
+
+def _resolve_content_mix(config: dict, total_limit: int) -> dict:
+    mode = config.get("content_mix_mode") or "posts_first_80_20"
+    ratios = {
+        "posts_first_80_20": (0.8, 0.2),
+        "posts_first_60_40": (0.6, 0.4),
+        "balanced_50_50": (0.5, 0.5),
+        "posts_only": (1.0, 0.0),
+        "videos_only": (0.0, 1.0),
+    }
+    post_ratio, video_ratio = ratios.get(mode, ratios["posts_first_80_20"])
+    posts_target = int(config.get("posts_target") or round(total_limit * post_ratio))
+    videos_target = int(config.get("videos_target") or (total_limit - posts_target if video_ratio > 0 else 0))
+    if mode == "posts_only":
+        posts_target, videos_target = total_limit, 0
+    elif mode == "videos_only":
+        posts_target, videos_target = 0, total_limit
+    posts_target = max(0, min(total_limit, posts_target))
+    videos_target = max(0, min(total_limit - posts_target, videos_target))
+    if posts_target + videos_target < total_limit:
+        posts_target += total_limit - posts_target - videos_target
+    return {
+        "mode": mode,
+        "posts_target": posts_target,
+        "videos_target": videos_target,
+        "prioritize_posts": _as_bool(config.get("prioritize_posts"), True),
+        "viral_only": _as_bool(config.get("viral_only"), False),
+    }
+
+
+def _viral_level(score: float) -> str:
+    if score < 100:
+        return "low"
+    if score < 300:
+        return "potential"
+    if score < 1000:
+        return "viral"
+    if score < 3000:
+        return "strong_viral"
+    return "very_viral"
+
+
+def _assign_viral_fields_local(item: dict) -> dict:
+    likes = _metric_value(item.get("likes_count"))
+    comments = _metric_value(item.get("comments_count"))
+    shares = _metric_value(item.get("shares_count"))
+    views = _metric_value(item.get("views_count"))
+    has_any_metric = any(v > 0 for v in (likes, comments, shares, views))
+    if item.get("metrics_valid") is False or not has_any_metric:
+        item["metrics_valid"] = False
+        item["viral_score"] = 0
+        item["viral_level"] = "unknown"
+        item["viral_reason"] = "metrics belum valid"
+        return item
+
+    score = likes + comments * 4 + shares * 6 + views * 0.02
+    reasons = []
+    viral_hit = False
+    if _is_video_result(item) and views >= 10000:
+        viral_hit = True
+        reasons.append("views >= 10000")
+    if comments >= 30:
+        viral_hit = True
+        reasons.append("comments >= 30")
+    if likes >= 100:
+        viral_hit = True
+        reasons.append("likes >= 100")
+    if shares >= 10:
+        viral_hit = True
+        reasons.append("shares >= 10")
+    if score >= 300:
+        viral_hit = True
+        reasons.append("viral_score >= 300")
+    if not reasons:
+        reasons.append("engagement rendah")
+
+    level = _viral_level(score)
+    if viral_hit and VIRAL_LEVEL_ORDER.get(level, 0) < VIRAL_LEVEL_ORDER["viral"]:
+        level = "viral"
+    item["viral_score"] = round(score, 2)
+    item["viral_level"] = level
+    item["viral_reason"] = ", ".join(reasons)
+    return item
+
+
+def _viral_sort_key(item: dict):
+    _assign_viral_fields_local(item)
+    return (
+        -_content_priority(item),
+        VIRAL_LEVEL_ORDER.get(item.get("viral_level", "unknown"), 0),
+        float(item.get("viral_score") or 0),
+        _metric_value(item.get("comments_count")),
+        _metric_value(item.get("likes_count")),
+        _metric_value(item.get("shares_count")),
+        _metric_value(item.get("views_count")),
+        str(item.get("timestamp") or item.get("created_time") or ""),
+    )
+
+
+def _priority_sort_key(item: dict):
+    _assign_viral_fields_local(item)
+    is_video = _is_video_result(item)
+    primary_metrics = (
+        _metric_value(item.get("views_count")),
+        _metric_value(item.get("comments_count")),
+        _metric_value(item.get("likes_count")),
+        _metric_value(item.get("shares_count")),
+    ) if is_video else (
+        _metric_value(item.get("comments_count")),
+        _metric_value(item.get("likes_count")),
+        _metric_value(item.get("shares_count")),
+        _metric_value(item.get("views_count")),
+    )
+    return (
+        _content_priority(item),
+        -primary_metrics[0],
+        -primary_metrics[1],
+        -primary_metrics[2],
+        -primary_metrics[3],
+        -float(item.get("viral_score") or 0),
+        -VIRAL_LEVEL_ORDER.get(item.get("viral_level", "unknown"), 0),
+        str(item.get("timestamp") or item.get("created_time") or ""),
+    )
+
+
+def _apply_content_mix_local(items: list, config: dict) -> list:
+    if not items:
+        return items
+    max_total = int(config.get("max_total", len(items)) or len(items))
+    mix = _resolve_content_mix(config, max_total)
+    for item in items:
+        _assign_viral_fields_local(item)
+        item["content_priority"] = _content_priority(item)
+
+    candidates = list(items)
+    if mix["viral_only"]:
+        candidates = [
+            item for item in candidates
+            if item.get("metrics_valid") is not False
+            and VIRAL_LEVEL_ORDER.get(item.get("viral_level", "unknown"), 0) >= VIRAL_LEVEL_ORDER["viral"]
+        ]
+
+    posts = sorted([item for item in candidates if not _is_video_result(item)], key=_priority_sort_key)
+    videos = sorted([item for item in candidates if _is_video_result(item)], key=_priority_sort_key)
+
+    if mix["mode"] == "posts_only":
+        selected = posts[:max_total]
+        for idx, item in enumerate(selected, 1):
+            item["rank"] = idx
+        return selected
+
+    if mix["mode"] == "videos_only":
+        selected = videos[:max_total]
+        for idx, item in enumerate(selected, 1):
+            item["rank"] = idx
+        return selected
+
+    selected = posts[:mix["posts_target"]] + videos[:mix["videos_target"]]
+    remaining_slots = max_total - len(selected)
+    if remaining_slots > 0:
+        selected_keys = {_content_key(item.get("url") or item.get("cleanHref")) for item in selected}
+        overflow = [
+            item for item in sorted(candidates, key=_priority_sort_key)
+            if _content_key(item.get("url") or item.get("cleanHref")) not in selected_keys
+        ]
+        selected.extend(overflow[:remaining_slots])
+    selected = sorted(selected[:max_total], key=_priority_sort_key)
+    for idx, item in enumerate(selected, 1):
+        item["rank"] = idx
+    return selected
 
 
 def _apply_sort_local(items: list, sort_by: str) -> list:
     """Apply sorting by the specified metric. Modifies list in-place."""
     if not items:
         return items
+    for item in items:
+        _assign_viral_fields_local(item)
 
-    if sort_by == "engagement":
-        items.sort(key=lambda x: _engagement_score(x), reverse=True)
+    if sort_by in ("engagement", "viral", "trending", "", None):
+        items.sort(key=_priority_sort_key)
     elif sort_by == "likes":
-        items.sort(key=lambda x: x.get("likes_count", 0), reverse=True)
+        items.sort(key=lambda x: _metric_value(x.get("likes_count")), reverse=True)
     elif sort_by == "comments":
-        items.sort(key=lambda x: x.get("comments_count", 0), reverse=True)
+        items.sort(key=lambda x: _metric_value(x.get("comments_count")), reverse=True)
     elif sort_by == "views":
-        items.sort(key=lambda x: x.get("views_count", 0), reverse=True)
+        items.sort(key=lambda x: _metric_value(x.get("views_count")), reverse=True)
     elif sort_by == "shares":
-        items.sort(key=lambda x: x.get("shares_count", 0), reverse=True)
+        items.sort(key=lambda x: _metric_value(x.get("shares_count")), reverse=True)
     elif sort_by == "recent":
         items.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
     else:
@@ -174,11 +412,11 @@ def _apply_min_filters_local(items: list, min_likes: Optional[int] = None,
         return items
     filtered = []
     for item in items:
-        if min_likes is not None and item.get("likes_count", 0) < min_likes:
+        if min_likes is not None and _metric_value(item.get("likes_count")) < min_likes:
             continue
-        if min_comments is not None and item.get("comments_count", 0) < min_comments:
+        if min_comments is not None and _metric_value(item.get("comments_count")) < min_comments:
             continue
-        if min_views is not None and item.get("views_count", 0) < min_views:
+        if min_views is not None and _metric_value(item.get("views_count")) < min_views:
             continue
         filtered.append(item)
     return filtered
@@ -339,19 +577,75 @@ def _log_progress(job_id: str, msg: str):
     print(f"[FB-DeepSearch:{job_id}] {msg}")
 
 
+def _is_monitor_recoverable_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in [
+        "event loop is closed",
+        "playwright already stopped",
+        "browser belum diinisialisasi",
+        "browser has been closed",
+        "target page",
+        "target closed",
+        "fb not logged in",
+        "fb session expired",
+    ])
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "fb not logged in" in text or "fb session expired" in text
+
+
+def _session_error_message() -> str:
+    return (
+        "Session Facebook tidak diterima browser Docker. "
+        "Import ulang cookie/login Facebook di menu Auth, lalu jalankan ulang scraping."
+    )
+
+
+def _restart_monitor(monitor):
+    try:
+        monitor.close()
+    except Exception:
+        pass
+    from fb_keyword_monitor import FacebookKeywordMonitor
+    fresh = FacebookKeywordMonitor()
+    try:
+        monitor.__dict__.clear()
+        monitor.__dict__.update(fresh.__dict__)
+        return monitor
+    except Exception:
+        return fresh
+
+
+def _monitor_call(job_id: str, monitor, fn_name: str, *args, **kwargs):
+    for attempt in range(2):
+        try:
+            return monitor, getattr(monitor, fn_name)(*args, **kwargs)
+        except Exception as exc:
+            if attempt == 0 and _is_monitor_recoverable_error(exc):
+                _log_progress(job_id, f"  Browser/session reset setelah error: {exc}")
+                monitor = _restart_monitor(monitor)
+                continue
+            raise
+
+
 def _finalize(job_id: str, posts: list, config: Optional[dict] = None):
     """
     CHANGES v3: Apply sort & min filters sebelum save final.
-    sort_by default "engagement" jika tidak ada di config.
+    sort_by default "trending" jika tidak ada di config.
     """
     if config is None:
         config = {}
 
-    sort_by = config.get("sort_by", "engagement")
+    sort_by = config.get("sort_by", "trending")
     min_likes = config.get("min_likes")
     min_comments = config.get("min_comments")
     min_views = config.get("min_views")
     recent_days = config.get("recent_days", 30)
+
+    for item in posts:
+        _assign_viral_fields_local(item)
 
     # Apply min filters
     posts = _apply_min_filters_local(posts, min_likes, min_comments, min_views)
@@ -359,6 +653,7 @@ def _finalize(job_id: str, posts: list, config: Optional[dict] = None):
     posts = _apply_recent_filter_local(posts, int(recent_days) if recent_days is not None else None)
     if recent_days and before_recent != len(posts):
         _log_progress(job_id, f"Filter waktu {recent_days} hari: {before_recent} -> {len(posts)} posts")
+    posts = _apply_content_mix_local(posts, config)
     # Apply sorting & assign rank
     posts = _apply_sort_local(posts, sort_by)
 
@@ -411,11 +706,27 @@ def _is_valid_result_url(url: str) -> bool:
         return True
     if re.search(r'facebook\.com/groups/[^/?#]+/?(?:[?#].*)?$', u):
         return True
+    if re.search(r'/(posts|permalink)/(?:\d+|pfbid[a-z0-9_-]+)', u):
+        return True
     if re.search(r'/(posts|permalink|videos|video|reel|reels)/\d+', u):
         return True
     if re.search(r'/(photo|photos)/\d+', u):
         return True
     return False
+
+def _is_search_post_card(item: dict, url: str) -> bool:
+    if (item.get("source") or "") != "search_post_card":
+        return False
+    u = (url or "").lower()
+    if "facebook.com/search/posts/" not in u or "fb_scrape_card=" not in u:
+        return False
+    text = " ".join(str(item.get(k, "") or "") for k in ("text", "caption", "author"))
+    return len(text.strip()) >= 20
+
+def _accept_result_item(item: dict, url: str) -> bool:
+    if not url:
+        return False
+    return _is_valid_result_url(url) or _is_search_post_card(item, url)
 
 def _content_key(url: str) -> str:
     if not url:
@@ -467,7 +778,17 @@ def _merge_duplicate_post(existing: dict, incoming: dict):
     if int(incoming.get("views_count", 0) or 0) > int(existing.get("views_count", 0) or 0):
         existing["views_count"] = incoming.get("views_count", 0)
 
+    if incoming.get("metrics_valid") is True and existing.get("metrics_valid") is not True:
+        for key in ("metrics_valid", "metric_source", "metrics_error", "detail_status", "detail_final_url", "metric_patterns"):
+            if key in incoming:
+                existing[key] = incoming.get(key)
+    else:
+        for key in ("metrics_valid", "metric_source", "metrics_error", "detail_status"):
+            if key not in existing and key in incoming:
+                existing[key] = incoming.get(key)
+
     existing["engagement_score"] = _engagement_score(existing)
+    _assign_viral_fields_local(existing)
 
 def _split_multi_query(raw: str, strip_hash: bool = False) -> list:
     """Split comma/newline/semicolon separated query text while preserving single-query behavior."""
@@ -493,7 +814,7 @@ def _merge_posts(new_posts: list, seen: set, posts: list,
     for p in new_posts:
         raw_url = p.get("url") or p.get("cleanHref")
         key = _content_key(raw_url)
-        if not raw_url or not _is_valid_result_url(raw_url):
+        if not _accept_result_item(p, raw_url):
             continue
         existing = next((x for x in posts if _content_key(x.get("url") or x.get("cleanHref")) == key), None)
         if existing:
@@ -507,9 +828,45 @@ def _merge_posts(new_posts: list, seen: set, posts: list,
         p["deep_query"] = root
         if source_key == "deep_source_tag":
             p["deep_root_tag"] = root
+        _assign_viral_fields_local(p)
         posts.append(p)
         added += 1
     return added
+
+
+def _second_pass_video_metrics(job_id: str, monitor, posts: list, config: dict):
+    if not posts:
+        return
+    invalid_videos = [
+        p for p in posts
+        if _is_video_result(p) and p.get("metrics_valid") is not True
+    ]
+    if not invalid_videos:
+        return
+    try:
+        detail_limit = int(config.get("detail_enrich_limit", DEFAULT_DETAIL_ENRICH_LIMIT))
+    except Exception:
+        detail_limit = DEFAULT_DETAIL_ENRICH_LIMIT
+    if _as_bool(config.get("fast_mode"), True):
+        detail_limit = min(detail_limit, DEFAULT_FAST_DETAIL_ENRICH_LIMIT)
+    try:
+        max_total = int(config.get("max_total", len(posts)) or len(posts))
+    except Exception:
+        max_total = len(posts)
+    mix = _resolve_content_mix(config, max_total)
+    detail_limit = min(detail_limit, mix["videos_target"])
+    detail_limit = max(0, min(detail_limit, len(invalid_videos)))
+    if detail_limit <= 0:
+        return
+    _log_progress(job_id, f"Second-pass detail video metrics: {detail_limit}/{len(invalid_videos)} invalid videos")
+    monitor.enrich_missing_details(
+        invalid_videos,
+        limit=detail_limit,
+        progress_callback=lambda msg: _log_progress(job_id, f"Second-pass {msg}"),
+    )
+    for item in posts:
+        _assign_viral_fields_local(item)
+    _write_posts(job_id, posts)
 
 
 # ── _worker_keyword ───────────────────────────────────────────────────────
@@ -520,12 +877,15 @@ def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
     types         = config.get("types", ["posts", "videos", "groups", "pages"])
     max_per_query = config.get("max_per_query", 200)
     max_total     = config.get("max_total", 1000)
-    sort_by       = config.get("sort_by", "engagement")
+    sort_by       = config.get("sort_by", "trending")
+    auth_failed   = False
+    mix           = _resolve_content_mix(config, max_total)
 
     if fast_mode:
         types = _fast_types(types)
         max_related = min(max_related, DEFAULT_FAST_MAX_RELATED)
         max_per_query = min(max_per_query, DEFAULT_FAST_ROOT_LIMIT)
+    types = _mix_types(types, mix)
 
     # Keep each keyword root bounded by max_per_query so multi-query jobs stay predictable.
     effective_per_query = min(max_total, max(25, max_per_query))
@@ -547,11 +907,92 @@ def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
     detail_limit = int(config.get("detail_enrich_limit", DEFAULT_DETAIL_ENRICH_LIMIT))
     if fast_mode:
         detail_limit = min(detail_limit, DEFAULT_FAST_DETAIL_ENRICH_LIMIT)
+    detail_limit = min(detail_limit, mix["videos_target"])
     root_kwargs = {**kwargs, "detail_enrich_limit": detail_limit}
     fast_kwargs = {**kwargs, "detail_enrich_limit": 0}
     related_limit = DEFAULT_FAST_RELATED_LIMIT if fast_mode else 80
+    related_types = _mix_types(["posts", "videos"], mix)
 
     root_keywords = _split_multi_query(keyword)
+    if mix["prioritize_posts"] and "posts" in types and "videos" in types and mix["mode"] not in {"videos_only"}:
+        seen: set = set()
+        posts: list = []
+        query_plan = []
+        for root_kw in root_keywords:
+            query_plan.append((root_kw, root_kw, True))
+            for rk in _generate_related_keywords(root_kw, max_related):
+                query_plan.append((rk, root_kw, False))
+
+        _log_progress(
+            job_id,
+            f"Posts-first mix: mode={mix['mode']} target posts={mix['posts_target']} videos={mix['videos_target']} queries={len(query_plan)}",
+        )
+
+        for qi, (q, root_kw, is_root) in enumerate(query_plan, 1):
+            if _is_cancelled(job_id) or _count_non_videos(posts) >= mix["posts_target"]:
+                break
+            remaining_posts = max(1, mix["posts_target"] - _count_non_videos(posts))
+            limit = min(effective_per_query if is_root else related_limit, remaining_posts)
+            _log_progress(job_id, f"Posts phase {qi}/{len(query_plan)}: '{q}' (limit={limit})...")
+            try:
+                monitor, result = _monitor_call(
+                    job_id,
+                    monitor,
+                    "scrape_keyword",
+                    q,
+                    max_results=limit,
+                    types=["posts"],
+                    **fast_kwargs,
+                )
+                added = _merge_posts(result.get("results", []), seen, posts, q, "deep_source", root_kw)
+                _log_progress(job_id, f"  posts +{added} (total: {_count_non_videos(posts)})")
+            except Exception as e:
+                if _is_auth_error(e):
+                    auth_failed = True
+                _log_progress(job_id, f"  ⚠️ posts '{q}' gagal: {e}")
+            _update_state(job_id, total_fetched=len(posts))
+            _write_posts(job_id, posts)
+
+        if mix["videos_target"] > 0:
+            for qi, (q, root_kw, is_root) in enumerate(query_plan, 1):
+                if _is_cancelled(job_id) or _count_videos(posts) >= mix["videos_target"]:
+                    break
+                remaining_videos = max(1, mix["videos_target"] - _count_videos(posts))
+                limit = min(effective_per_query if is_root else related_limit, remaining_videos)
+                video_detail_limit = min(detail_limit, remaining_videos)
+                _log_progress(job_id, f"Videos phase {qi}/{len(query_plan)}: '{q}' (limit={limit}, detail={video_detail_limit})...")
+                try:
+                    monitor, result = _monitor_call(
+                        job_id,
+                        monitor,
+                        "scrape_keyword",
+                        q,
+                        max_results=limit,
+                        types=["videos"],
+                        **{**kwargs, "detail_enrich_limit": video_detail_limit},
+                    )
+                    added = _merge_posts(result.get("results", []), seen, posts, q, "deep_source", root_kw)
+                    _log_progress(job_id, f"  videos +{added} (total: {_count_videos(posts)})")
+                except Exception as e:
+                    if _is_auth_error(e):
+                        auth_failed = True
+                    _log_progress(job_id, f"  ⚠️ videos '{q}' gagal: {e}")
+                _update_state(job_id, total_fetched=len(posts))
+                _write_posts(job_id, posts)
+
+        if not posts and auth_failed:
+            raise RuntimeError(_session_error_message())
+        _second_pass_video_metrics(job_id, monitor, posts, config)
+        if max_comments_per_post > 0 and posts:
+            _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
+            monitor.enrich_comments(
+                posts, max_comments_per_post, top_comments_count,
+                lambda msg: _log_progress(job_id, msg),
+            )
+            _write_posts(job_id, posts)
+        _finalize(job_id, posts, config)
+        return
+
     if len(root_keywords) > 1:
         seen: set = set()
         posts: list = []
@@ -568,10 +1009,12 @@ def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
             root_limit = max(1, min(effective_per_query, remaining))
             _log_progress(job_id, f"Query {qi}/{len(root_keywords)}: scraping '{root_kw}' (limit={root_limit}, types={types})...")
             try:
-                result = monitor.scrape_keyword(root_kw, max_results=root_limit, types=types, **root_kwargs)
+                monitor, result = _monitor_call(job_id, monitor, "scrape_keyword", root_kw, max_results=root_limit, types=types, **root_kwargs)
                 added = _merge_posts(result.get("results", []), seen, posts, root_kw, "deep_source", root_kw)
                 _log_progress(job_id, f"  '{root_kw}': +{added} posts (combined total: {len(posts)})")
             except Exception as e:
+                if _is_auth_error(e):
+                    auth_failed = True
                 _log_progress(job_id, f"  \u26a0\ufe0f '{root_kw}' gagal: {e}")
 
             related_keywords = _generate_related_keywords(root_kw, max_related)
@@ -583,16 +1026,21 @@ def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
                     time.sleep(random.uniform(0.3, 1.0))
                 _log_progress(job_id, f"    [{i}/{len(related_keywords)}] '{rk}'...")
                 try:
-                    r2 = monitor.scrape_keyword(rk, max_results=min(related_limit, max_total - len(posts)), types=["posts", "videos"], **fast_kwargs)
+                    monitor, r2 = _monitor_call(job_id, monitor, "scrape_keyword", rk, max_results=min(related_limit, max_total - len(posts)), types=related_types, **fast_kwargs)
                     added2 = _merge_posts(r2.get("results", []), seen, posts, rk, "deep_source", root_kw)
                     _log_progress(job_id, f"      +{added2} posts (combined total: {len(posts)})")
                 except Exception as e:
+                    if _is_auth_error(e):
+                        auth_failed = True
                     _log_progress(job_id, f"      \u26a0\ufe0f '{rk}' gagal: {e}")
 
             _update_state(job_id, total_fetched=len(posts))
             _write_posts(job_id, posts)
             _log_progress(job_id, f"  Flush after '{root_kw}': {len(posts)} posts saved to disk")
 
+        if not posts and auth_failed:
+            raise RuntimeError(_session_error_message())
+        _second_pass_video_metrics(job_id, monitor, posts, config)
         if max_comments_per_post > 0 and posts:
             _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
             monitor.enrich_comments(
@@ -616,11 +1064,13 @@ def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
         _log_progress(job_id, f"  (comment scraping enabled: {max_comments_per_post}/post, top {top_comments_count})")
 
     try:
-        result = monitor.scrape_keyword(keyword, max_results=effective_per_query,
+        monitor, result = _monitor_call(job_id, monitor, "scrape_keyword", keyword, max_results=effective_per_query,
                                          types=types, **root_kwargs)
         added = _merge_posts(result.get("results", []), seen, posts, keyword, "deep_source", keyword)
         _log_progress(job_id, f"  '{keyword}': +{added} posts (total: {len(posts)})")
     except Exception as e:
+        if _is_auth_error(e):
+            auth_failed = True
         _log_progress(job_id, f"  \u26a0\ufe0f '{keyword}' gagal: {e}")
 
     _update_state(job_id, total_fetched=len(posts))
@@ -641,16 +1091,21 @@ def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
             time.sleep(random.uniform(0.3, 1.0))
         _log_progress(job_id, f"  [{i}/{len(related_keywords)}] '{rk}'...")
         try:
-            r2 = monitor.scrape_keyword(rk, max_results=related_limit, types=["posts", "videos"], **fast_kwargs)
+            monitor, r2 = _monitor_call(job_id, monitor, "scrape_keyword", rk, max_results=related_limit, types=related_types, **fast_kwargs)
             added2 = _merge_posts(r2.get("results", []), seen, posts, rk, "deep_source", keyword)
             _log_progress(job_id, f"    +{added2} posts (total: {len(posts)})")
         except Exception as e:
+            if _is_auth_error(e):
+                auth_failed = True
             _log_progress(job_id, f"    \u26a0\ufe0f '{rk}' gagal: {e}")
 
         _update_state(job_id, total_fetched=len(posts))
         _write_posts(job_id, posts)
         _log_progress(job_id, f"  Flush: {len(posts)} posts saved to disk")
 
+    if not posts and auth_failed:
+        raise RuntimeError(_session_error_message())
+    _second_pass_video_metrics(job_id, monitor, posts, config)
     if max_comments_per_post > 0 and posts:
         _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
         monitor.enrich_comments(
@@ -665,14 +1120,19 @@ def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
 def _worker_hashtag(job_id: str, tag: str, config: dict, monitor):
     """Deep search hashtag — sequential seperti keyword worker."""
     fast_mode     = _as_bool(config.get("fast_mode"), True)
+    types         = config.get("types", ["posts", "videos"])
     max_related   = config.get("max_related_hashtags", 10)
     max_per_query = config.get("max_per_query", 300)
     max_total     = config.get("max_total", 1000)
-    sort_by       = config.get("sort_by", "engagement")
+    sort_by       = config.get("sort_by", "trending")
+    auth_failed   = False
+    mix           = _resolve_content_mix(config, max_total)
 
     if fast_mode:
+        types = _fast_types(types)
         max_related = min(max_related, DEFAULT_FAST_MAX_RELATED)
         max_per_query = min(max_per_query, DEFAULT_FAST_ROOT_LIMIT)
+    types = _mix_types(types, mix)
 
     # Keep each hashtag root bounded by max_per_query so multi-tag jobs stay predictable.
     effective_per_query = min(max_total, max(25, max_per_query))
@@ -692,9 +1152,11 @@ def _worker_hashtag(job_id: str, tag: str, config: dict, monitor):
     detail_limit = int(config.get("detail_enrich_limit", DEFAULT_DETAIL_ENRICH_LIMIT))
     if fast_mode:
         detail_limit = min(detail_limit, DEFAULT_FAST_DETAIL_ENRICH_LIMIT)
+    detail_limit = min(detail_limit, mix["videos_target"])
     root_kwargs = {**kwargs, "detail_enrich_limit": detail_limit}
     fast_kwargs = {**kwargs, "detail_enrich_limit": 0}
     related_limit = DEFAULT_FAST_RELATED_LIMIT if fast_mode else 100
+    related_types = _mix_types(["posts", "videos"], mix)
 
     root_tags = _split_multi_query(tag, strip_hash=True)
     if len(root_tags) > 1:
@@ -713,10 +1175,12 @@ def _worker_hashtag(job_id: str, tag: str, config: dict, monitor):
             root_limit = max(1, min(effective_per_query, remaining))
             _log_progress(job_id, f"Query {qi}/{len(root_tags)}: scraping '#{root_tag}' (limit={root_limit})...")
             try:
-                result = monitor.scrape_hashtag(root_tag, max_results=root_limit, **root_kwargs)
+                monitor, result = _monitor_call(job_id, monitor, "scrape_hashtag", root_tag, max_results=root_limit, types=types, **root_kwargs)
                 added = _merge_posts(result.get("results", []), seen, posts, root_tag, "deep_source_tag", root_tag)
                 _log_progress(job_id, f"  '#{root_tag}': +{added} posts (combined total: {len(posts)})")
             except Exception as e:
+                if _is_auth_error(e):
+                    auth_failed = True
                 _log_progress(job_id, f"  \u26a0\ufe0f '#{root_tag}' gagal: {e}")
 
             related = _generate_related_hashtags(root_tag, max_related, posts)
@@ -728,18 +1192,23 @@ def _worker_hashtag(job_id: str, tag: str, config: dict, monitor):
                     time.sleep(random.uniform(0.3, 1.0))
                 _log_progress(job_id, f"    [{i}/{len(related)}] '{rk}'...")
                 try:
-                    r2 = monitor.scrape_keyword(rk, max_results=min(related_limit, max_total - len(posts)), types=["posts", "videos"], **fast_kwargs)
+                    monitor, r2 = _monitor_call(job_id, monitor, "scrape_keyword", rk, max_results=min(related_limit, max_total - len(posts)), types=related_types, **fast_kwargs)
                     from fb_keyword_monitor import _hashtag_in_item
                     relevant = [p for p in r2.get("results", []) if _hashtag_in_item(p, root_tag)]
                     added2 = _merge_posts(relevant, seen, posts, rk, "deep_source_tag", root_tag)
                     _log_progress(job_id, f"      +{added2} posts (combined total: {len(posts)})")
                 except Exception as e:
+                    if _is_auth_error(e):
+                        auth_failed = True
                     _log_progress(job_id, f"      \u26a0\ufe0f '{rk}' gagal: {e}")
 
             _update_state(job_id, total_fetched=len(posts))
             _write_posts(job_id, posts)
             _log_progress(job_id, f"  Flush after '#{root_tag}': {len(posts)} posts saved to disk")
 
+        if not posts and auth_failed:
+            raise RuntimeError(_session_error_message())
+        _second_pass_video_metrics(job_id, monitor, posts, config)
         if max_comments_per_post > 0 and posts:
             _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
             monitor.enrich_comments(
@@ -764,11 +1233,13 @@ def _worker_hashtag(job_id: str, tag: str, config: dict, monitor):
         _log_progress(job_id, f"  (comment scraping enabled: {max_comments_per_post}/post)")
 
     try:
-        result = monitor.scrape_hashtag(tag, max_results=effective_per_query, **root_kwargs)
+        monitor, result = _monitor_call(job_id, monitor, "scrape_hashtag", tag, max_results=effective_per_query, types=types, **root_kwargs)
         # result['results'] sudah ter-sort dan ter-filter oleh monitor
         added = _merge_posts(result.get("results", []), seen, posts, tag, "deep_source_tag", tag)
         _log_progress(job_id, f"  '#{tag}': +{added} posts (total: {len(posts)})")
     except Exception as e:
+        if _is_auth_error(e):
+            auth_failed = True
         _log_progress(job_id, f"  \u26a0\ufe0f '#{tag}' gagal: {e}")
 
     _update_state(job_id, total_fetched=len(posts))
@@ -789,18 +1260,23 @@ def _worker_hashtag(job_id: str, tag: str, config: dict, monitor):
             time.sleep(random.uniform(0.3, 1.0))
         _log_progress(job_id, f"  [{i}/{len(related)}] '{rk}'...")
         try:
-            r2 = monitor.scrape_keyword(rk, max_results=related_limit, types=["posts", "videos"], **fast_kwargs)
+            monitor, r2 = _monitor_call(job_id, monitor, "scrape_keyword", rk, max_results=related_limit, types=related_types, **fast_kwargs)
             from fb_keyword_monitor import _hashtag_in_item
             relevant = [p for p in r2.get("results", []) if _hashtag_in_item(p, tag)]
             added2 = _merge_posts(relevant, seen, posts, rk, "deep_source_tag", tag)
             _log_progress(job_id, f"    +{added2} posts (total: {len(posts)})")
         except Exception as e:
+            if _is_auth_error(e):
+                auth_failed = True
             _log_progress(job_id, f"    \u26a0\ufe0f '{rk}' gagal: {e}")
 
         _update_state(job_id, total_fetched=len(posts))
         _write_posts(job_id, posts)
         _log_progress(job_id, f"  Flush: {len(posts)} posts saved to disk")
 
+    if not posts and auth_failed:
+        raise RuntimeError(_session_error_message())
+    _second_pass_video_metrics(job_id, monitor, posts, config)
     if max_comments_per_post > 0 and posts:
         _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
         monitor.enrich_comments(
@@ -817,9 +1293,12 @@ def _worker_trending(job_id: str, query: str, config: dict, monitor):
     fast_mode = _as_bool(config.get("fast_mode"), True)
     types     = config.get("types", ["posts", "videos", "groups", "pages"])
     max_total = config.get("max_total", 1000)
-    sort_by   = config.get("sort_by", "engagement")
+    sort_by   = config.get("sort_by", "trending")
+    auth_failed = False
+    mix = _resolve_content_mix(config, max_total)
     if fast_mode:
         types = _fast_types(types)
+    types = _mix_types(types, mix)
 
     # v4: comment scraping params
     max_comments_per_post = config.get("max_comments_per_post", 0)
@@ -836,6 +1315,7 @@ def _worker_trending(job_id: str, query: str, config: dict, monitor):
     detail_limit = int(config.get("detail_enrich_limit", DEFAULT_DETAIL_ENRICH_LIMIT))
     if fast_mode:
         detail_limit = min(detail_limit, DEFAULT_FAST_DETAIL_ENRICH_LIMIT)
+    detail_limit = min(detail_limit, mix["videos_target"])
     root_kwargs = {**kwargs, "detail_enrich_limit": detail_limit}
 
     seen:  set  = set()
@@ -868,7 +1348,10 @@ def _worker_trending(job_id: str, query: str, config: dict, monitor):
         _log_progress(job_id, f"[{i}/{len(search_keywords)}] Trending: '{kw}' (limit={per_keyword_limit})...")
         try:
             # monitor.scrape_trending() sudah handle engagement filter internal
-            result = monitor.scrape_trending(
+            monitor, result = _monitor_call(
+                job_id,
+                monitor,
+                "scrape_trending",
                 max_results=per_keyword_limit,
                 keyword=kw,
                 types=types,
@@ -878,7 +1361,7 @@ def _worker_trending(job_id: str, query: str, config: dict, monitor):
             for p in result.get("results", []):
                 raw_url = p.get("url") or p.get("cleanHref")
                 key = _content_key(raw_url)
-                if not raw_url or key in seen or not _is_valid_result_url(raw_url):
+                if key in seen or not _accept_result_item(p, raw_url):
                     continue
                 seen.add(key)
                 p["deep_source"] = kw
@@ -888,12 +1371,17 @@ def _worker_trending(job_id: str, query: str, config: dict, monitor):
                 added += 1
             _log_progress(job_id, f"  +{added} posts (total: {len(posts)})")
         except Exception as e:
+            if _is_auth_error(e):
+                auth_failed = True
             _log_progress(job_id, f"  \u26a0\ufe0f '{kw}' gagal: {e}")
 
         _update_state(job_id, total_fetched=len(posts))
         _write_posts(job_id, posts)
         _log_progress(job_id, f"  Flush: {len(posts)} posts saved to disk")
 
+    if not posts and auth_failed:
+        raise RuntimeError(_session_error_message())
+    _second_pass_video_metrics(job_id, monitor, posts, config)
     if max_comments_per_post > 0 and posts:
         _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
         monitor.enrich_comments(

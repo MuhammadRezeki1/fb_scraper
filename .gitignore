@@ -22,6 +22,7 @@ backend/fb_profile/
 output_facebook/
 fb_keyword_debug/
 backend/fb_keyword_debug/
+backend/fb_post_debug/
 backend/debug_output/
 backend/fb_debug_output/
 backend/fb_dom_debug_output/

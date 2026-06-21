@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 from colorama import Fore, init
 from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeout
 
+from browser_runtime import browser_channel_kwargs
 from sentiment_analyzer_v2 import SentimentAnalyzerV2
 
 init(autoreset=True)
@@ -156,7 +157,7 @@ class FacebookScraperV21:
 
         context = self.playwright.chromium.launch_persistent_context(
             FB_CHROME_PROFILE,
-            channel="chrome",
+            **browser_channel_kwargs(),
             headless=HEADLESS,
             args=args,
             no_viewport=True,
@@ -744,6 +745,7 @@ class FacebookScraperV21:
             }""")
             if not clicked:
                 print(Fore.YELLOW + "   [REACTIONS] Tombol reaction tidak ditemukan")
+                self._debug_reaction_dialog_snapshot("reaction_button_not_found")
                 return []
 
             time.sleep(2.5)
@@ -757,28 +759,48 @@ class FacebookScraperV21:
                     const clean = (text) => (text || '').replace(/\s+/g, ' ').trim();
                     const badName = /(tambahkan teman|add friend|ikuti|follow|mengikuti|message|pesan|lihat profil|view profile|teman bersama|mutual|reaction|reaksi|suka|like)$/i;
                     const badUrl = /(\/help\/|\/privacy\/|\/legal\/|\/groups\/|\/events\/|\/watch\/|\/reel\/|\/videos\/|\/photo|\/posts\/|\/permalink\/|\/ufi\/reaction)/i;
+                    const isProfileHref = (href) =>
+                        href && href.includes('facebook.com') && !badUrl.test(href) &&
+                        (/facebook\.com\/[a-zA-Z0-9._-]{3,}/.test(href) || /profile\.php\?id=\d+/.test(href));
+                    const pickName = (lines) => lines.find(line =>
+                        line.length >= 2 && line.length <= 90 &&
+                        !badName.test(line) && !/^\d/.test(line) && !line.includes('facebook.com')
+                    );
                     const dialog = Array.from(document.querySelectorAll('[role="dialog"]')).pop() || document.body;
                     const rows = [];
-                    const anchors = [...dialog.querySelectorAll('a[href]')];
-                    anchors.forEach(a => {
+                    const pushed = new Set();
+                    const addRow = (name, href) => {
+                        const url = (href || '').split('?')[0].split('#')[0];
+                        const key = (url || name).toLowerCase();
+                        if (!name || pushed.has(key)) return;
+                        pushed.add(key);
+                        rows.push({ name, profile_url: url, reaction_type: '' });
+                    };
+
+                    // Pass 1: nama ada di dalam anchor profil
+                    [...dialog.querySelectorAll('a[href]')].forEach(a => {
                         const href = a.href || a.getAttribute('href') || '';
-                        if (!href || !href.includes('facebook.com') || badUrl.test(href)) return;
-                        const lines = clean(a.innerText || a.textContent || '')
-                            .split(/\n+/).map(clean).filter(Boolean);
-                        const name = lines.find(line =>
-                            line.length >= 2 &&
-                            line.length <= 90 &&
-                            !badName.test(line) &&
-                            !/^\d/.test(line) &&
-                            !line.includes('facebook.com')
-                        );
-                        if (!name) return;
-                        rows.push({
-                            name,
-                            profile_url: href.split('?')[0].split('#')[0],
-                            reaction_type: '',
-                        });
+                        if (!isProfileHref(href)) return;
+                        const name = pickName(clean(a.innerText || a.textContent || '').split(/\n+/).map(clean).filter(Boolean));
+                        if (name) addRow(name, href);
                     });
+
+                    // Pass 2 (fallback): baris list — anchor avatar tanpa teks, nama di span sebelah
+                    if (rows.length === 0) {
+                        const listRows = [
+                            ...dialog.querySelectorAll('[role="listitem"]'),
+                            ...dialog.querySelectorAll('div[role="none"] > div, ul > li'),
+                        ];
+                        listRows.forEach(row => {
+                            const a = [...row.querySelectorAll('a[href]')].find(x => isProfileHref(x.href || x.getAttribute('href') || ''));
+                            const href = a ? (a.href || a.getAttribute('href') || '') : '';
+                            const spans = [...row.querySelectorAll('span[dir="auto"], strong, span')]
+                                .map(s => clean(s.innerText || s.textContent || '')).filter(Boolean);
+                            const name = pickName(spans);
+                            if (name) addRow(name, href);
+                        });
+                    }
+
                     return rows.slice(0, limit);
                 }""", max_reactors)
 
@@ -820,6 +842,8 @@ class FacebookScraperV21:
                     break
                 time.sleep(0.8 if added == 0 else 0.45)
 
+            if not reactors:
+                self._debug_reaction_dialog_snapshot("reaction_dialog_empty")
             try:
                 self.pg.keyboard.press("Escape")
             except Exception:
@@ -1279,6 +1303,9 @@ class FacebookScraperV21:
             print(Fore.YELLOW + f"   ⚠️  JS extract gagal ({e}), fallback locator...")
             return self._extract_all_comments_locator(max_comments)
 
+        if not raw:
+            raw = self._extract_reel_comments_from_visible_panel(max_comments)
+
         print(Fore.CYAN + f"   📊 Kandidat dari DOM: {len(raw)}")
         # DEBUG: tampilkan sample aria-label untuk verifikasi pattern reply
         replies_sample = [r for r in raw if r.get("is_reply")]
@@ -1341,6 +1368,190 @@ class FacebookScraperV21:
         n_reply = sum(1 for c in comments if c["is_reply"])
         print(Fore.GREEN + f"   ✅ {len(comments)} item ({len(comments)-n_reply} komentar + {n_reply} balasan)")
         return comments
+
+    def _extract_reel_comments_from_visible_panel(self, max_comments: int) -> List[Dict]:
+        """
+        Fallback Reels terbaru: komentar kadang muncul sebagai blok panel biasa,
+        bukan role=article dengan aria "Komentar oleh ...".
+        """
+        try:
+            raw = self.pg.evaluate(r"""(maxItems) => {
+                const clean = (text) => (text || '')
+                    .replace(/\u00a0|\xa0/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                const badLine = /^(suka|like|balas|reply|bagikan|share|komentari|comment|reels?|publik|public|audio asli|original audio|lihat selengkapnya|see more)$/i;
+                const timeRe = /(?:baru saja|kemarin|\d+\s*(?:d|h|j|jam|mnt|menit|detik|hari|minggu|bulan|tahun|w|y)\b|just now|yesterday|\d+\s*(?:sec|second|min|minute|hour|day|week|month|year)s?\b)/i;
+                const actionRe = /\b(?:suka|like|balas|reply|reaksi|reaction)\b/i;
+                const chromeRe = /(tulis komentar|write a comment|paling relevan|most relevant|semua komentar|all comments|masuk|lupa akun|facebook|notifikasi|lihat semua|view all|pelajari selengkapnya)/i;
+                const panels = [
+                    ...document.querySelectorAll('[role="complementary"]'),
+                    ...document.querySelectorAll('div[aria-label*="Komentar"],div[aria-label*="komentar"],div[aria-label*="Comments"],div[aria-label*="comments"]')
+                ].filter(Boolean);
+                const scope = panels.find(p => clean(p.innerText).length > 20) || document.body;
+                const out = [];
+                const seen = new Set();
+
+                const getAuthor = (el) => {
+                    const linkCandidates = [
+                        ...el.querySelectorAll('a[role="link"], a[href*="facebook.com"], a[href*="profile.php"]')
+                    ];
+                    for (const a of linkCandidates) {
+                        const t = clean(a.innerText || a.textContent || a.getAttribute('aria-label') || '');
+                        if (!t || t.length < 2 || t.length > 80) continue;
+                        if (badLine.test(t) || timeRe.test(t) || chromeRe.test(t)) continue;
+                        return t;
+                    }
+                    const spans = [...el.querySelectorAll('span[dir="auto"], strong, h3, h4')];
+                    for (const s of spans) {
+                        const t = clean(s.innerText || s.textContent || '');
+                        if (!t || t.length < 2 || t.length > 80) continue;
+                        if (badLine.test(t) || timeRe.test(t) || chromeRe.test(t)) continue;
+                        return t;
+                    }
+                    return '';
+                };
+
+                const getText = (el, author) => {
+                    const textNodes = [
+                        ...el.querySelectorAll('div[dir="auto"], span[dir="auto"]')
+                    ].map(n => clean(n.innerText || n.textContent || ''))
+                     .filter(Boolean)
+                     .filter(t => t !== author)
+                     .filter(t => !badLine.test(t))
+                     .filter(t => !timeRe.test(t))
+                     .filter(t => !chromeRe.test(t))
+                     .filter(t => !/^\d+([\.,]\d+)?\s*(rb|jt|k|m)?$/i.test(t));
+                    textNodes.sort((a, b) => b.length - a.length);
+                    return textNodes[0] || '';
+                };
+
+                const getLikes = (el) => {
+                    const combined = clean(`${el.getAttribute('aria-label') || ''} ${el.innerText || ''}`);
+                    const m = combined.match(/(\d+(?:[.,]\d+)?)\s*(?:reaksi|reaction|suka|likes?)/i);
+                    return m ? m[1] : '0';
+                };
+
+                const getTimestamp = (el) => {
+                    const parts = [
+                        ...el.querySelectorAll('a, span, div')
+                    ].map(n => clean(n.innerText || n.textContent || ''));
+                    return parts.find(t => timeRe.test(t) && t.length < 40) || '';
+                };
+
+                const candidates = [];
+                [
+                    '[role="article"]',
+                    '[role="listitem"]',
+                    'li',
+                    'div[aria-label^="Komentar oleh"]',
+                    'div[aria-label^="Comment by"]',
+                    'div[aria-label^="Balasan"]',
+                    'div[aria-label^="Reply"]'
+                ].forEach(sel => scope.querySelectorAll(sel).forEach(el => candidates.push(el)));
+
+                scope.querySelectorAll('div').forEach(el => {
+                    const txt = clean(el.innerText || '');
+                    if (txt.length < 15 || txt.length > 900) return;
+                    if (!actionRe.test(txt) && !timeRe.test(txt)) return;
+                    candidates.push(el);
+                });
+
+                for (const el of candidates) {
+                    if (out.length >= maxItems + 100) break;
+                    const full = clean(el.innerText || el.textContent || '');
+                    if (!full || full.length < 10 || full.length > 1200) continue;
+                    if (chromeRe.test(full) && !actionRe.test(full)) continue;
+                    const author = getAuthor(el);
+                    if (!author) continue;
+                    const text = getText(el, author);
+                    if (!text || text.length < 2 || text === author) continue;
+                    const key = `${author}::${text}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    const aria = el.getAttribute('aria-label') || '';
+                    const isReply = /^Balasan|^Reply/i.test(aria);
+                    out.push({
+                        author,
+                        text,
+                        is_reply: !!isReply,
+                        reply_to: '',
+                        likes_raw: getLikes(el),
+                        timestamp: getTimestamp(el),
+                        _aria: aria.slice(0, 80) || 'visible_panel'
+                    });
+                }
+                return out;
+            }""", max_comments)
+            if raw:
+                print(Fore.CYAN + f"   🔁 Fallback panel Reels menemukan {len(raw)} kandidat")
+            else:
+                self._debug_comment_panel_snapshot("no_visible_panel_comments")
+            return raw or []
+        except Exception as e:
+            print(Fore.YELLOW + f"   ⚠️  fallback panel komentar gagal: {e}")
+            self._debug_comment_panel_snapshot(str(e))
+            return []
+
+    def _debug_comment_panel_snapshot(self, reason: str):
+        try:
+            os.makedirs("fb_post_debug", exist_ok=True)
+            payload = self.pg.evaluate(r"""(reason) => {
+                const clean = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                const panels = [
+                    ...document.querySelectorAll('[role="complementary"]'),
+                    ...document.querySelectorAll('div[aria-label*="Komentar"],div[aria-label*="komentar"],div[aria-label*="Comments"],div[aria-label*="comments"]')
+                ];
+                return {
+                    reason,
+                    url: location.href,
+                    body: (document.body.innerText || '').slice(0, 5000),
+                    panels: panels.slice(0, 5).map(p => ({
+                        aria: p.getAttribute('aria-label') || '',
+                        text: clean(p.innerText || '').slice(0, 2000),
+                        articles: p.querySelectorAll('[role="article"]').length,
+                        listitems: p.querySelectorAll('[role="listitem"],li').length,
+                        dirAuto: p.querySelectorAll('[dir="auto"]').length
+                    }))
+                };
+            }""", reason[:300])
+            name = f"comments_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{random.randint(100000, 999999)}.json"
+            with open(os.path.join("fb_post_debug", name), "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            print(Fore.YELLOW + f"   🧪 Snapshot komentar disimpan: fb_post_debug/{name}")
+        except Exception as e:
+            print(Fore.YELLOW + f"   ⚠️  debug snapshot komentar gagal: {e}")
+
+    def _debug_reaction_dialog_snapshot(self, reason: str):
+        """Dump struktur dialog reaction supaya bisa diperbaiki kalau 0 akun."""
+        try:
+            os.makedirs("fb_post_debug", exist_ok=True)
+            payload = self.pg.evaluate(r"""(reason) => {
+                const clean = (t) => (t || '').replace(/\s+/g, ' ').trim();
+                const dialogs = [...document.querySelectorAll('[role="dialog"]')];
+                const last = dialogs[dialogs.length - 1] || null;
+                const sampleAnchors = last ? [...last.querySelectorAll('a[href]')].slice(0, 25).map(a => ({
+                    href: (a.href || a.getAttribute('href') || '').slice(0, 120),
+                    text: clean(a.innerText || a.textContent || '').slice(0, 80),
+                    aria: (a.getAttribute('aria-label') || '').slice(0, 80),
+                })) : [];
+                return {
+                    reason,
+                    url: location.href,
+                    dialog_count: dialogs.length,
+                    last_dialog_aria: last ? (last.getAttribute('aria-label') || '') : '(no dialog)',
+                    last_dialog_text: last ? clean(last.innerText || '').slice(0, 2000) : '',
+                    last_dialog_listitems: last ? last.querySelectorAll('[role="listitem"],li').length : 0,
+                    last_dialog_anchors: last ? last.querySelectorAll('a[href]').length : 0,
+                    sample_anchors: sampleAnchors,
+                };
+            }""", reason[:300])
+            name = f"reactions_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{random.randint(100000, 999999)}.json"
+            with open(os.path.join("fb_post_debug", name), "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            print(Fore.YELLOW + f"   🧪 Snapshot reaction disimpan: fb_post_debug/{name}")
+        except Exception as e:
+            print(Fore.YELLOW + f"   ⚠️  debug snapshot reaction gagal: {e}")
 
     def _extract_all_comments_locator(self, max_comments: int) -> List[Dict]:
         """Fallback lama berbasis Playwright locator (lebih lambat)."""
@@ -1707,20 +1918,48 @@ class FacebookScraperV21:
                 self._display_caption_box(result["caption"], cap_sent["category"], cap_sent)
 
             # Scroll + akumulasi komentar per-round (anti‑virtualization)
-            target_total_items = max_comments >= 5000
-            comment_target = max_comments
-            if target_total_items and result.get("total_comments", 0) > 0:
-                comment_target = min(max_comments, max(1, int(result["total_comments"])))
-                print(Fore.CYAN + f"   [COMMENTS] Target disesuaikan dari {max_comments:,} ke {comment_target:,} berdasarkan total komentar post")
-            elif target_total_items:
-                comment_target = min(max_comments, ALL_COMMENTS_FALLBACK_TARGET)
-                print(Fore.YELLOW + f"   [COMMENTS] Total komentar tidak terbaca, pakai fallback target {comment_target:,}")
-            raw_comments = self._scroll_to_load_comments(
-                comment_target,
-                include_replies=include_replies,
-                target_total_items=target_total_items,
-            )
-            raw_comments = self._dedup_comments(raw_comments)
+            if max_comments <= 0:
+                print(Fore.YELLOW + "   [COMMENTS] Skip komentar (max_comments=0)")
+                raw_comments = []
+            else:
+                target_total_items = max_comments >= 5000
+                comment_target = max_comments
+                if target_total_items and result.get("total_comments", 0) > 0:
+                    comment_target = min(max_comments, max(1, int(result["total_comments"])))
+                    print(Fore.CYAN + f"   [COMMENTS] Target disesuaikan dari {max_comments:,} ke {comment_target:,} berdasarkan total komentar post")
+                elif target_total_items:
+                    comment_target = min(max_comments, ALL_COMMENTS_FALLBACK_TARGET)
+                    print(Fore.YELLOW + f"   [COMMENTS] Total komentar tidak terbaca, pakai fallback target {comment_target:,}")
+                raw_comments = self._scroll_to_load_comments(
+                    comment_target,
+                    include_replies=include_replies,
+                    target_total_items=target_total_items,
+                )
+
+                # FIX REEL: viewer reel sering menyajikan panel komentar kosong
+                # (video gagal play / autoplay pindah reel). Coba ulang lewat
+                # halaman watch theater yang lebih stabil. Hanya jalan kalau FB
+                # melaporkan ada komentar tapi kita dapat 0 — jadi tidak mengganggu
+                # post foto/biasa yang sudah berhasil.
+                if (not raw_comments
+                        and result["post_type"] in ("reel", "video")
+                        and result.get("post_id")
+                        and int(result.get("total_comments") or 0) > 0):
+                    watch_url = f"https://www.facebook.com/watch/?v={result['post_id']}"
+                    print(Fore.YELLOW + f"   🔁 Komentar reel kosong — coba ulang via watch theater: {watch_url}")
+                    try:
+                        self._navigate_and_extract_id(watch_url)
+                        self._open_reel_comments()
+                        time.sleep(2)
+                        raw_comments = self._scroll_to_load_comments(
+                            comment_target,
+                            include_replies=include_replies,
+                            target_total_items=target_total_items,
+                        )
+                    except Exception as e:
+                        print(Fore.YELLOW + f"   ⚠️  Retry watch theater gagal: {e}")
+
+                raw_comments = self._dedup_comments(raw_comments)
             print(Fore.GREEN + f"\n✅ Setelah dedup: {len(raw_comments)} komentar unik")
 
             if raw_comments:

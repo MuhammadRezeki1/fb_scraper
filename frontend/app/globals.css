@@ -1,13 +1,15 @@
 @import "tailwindcss";
 
 @theme inline {
-  --font-sans: 'Outfit', system-ui, sans-serif;
+  --font-sans: var(--font-outfit);
   --font-mono: var(--font-geist-mono);
   --color-glass: rgba(0, 0, 0, 0.05);
   --color-glass-border: rgba(0, 0, 0, 0.07);
 }
 
 :root {
+  --font-sora: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-outfit: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --bg-primary: #f4f5f7;
   --bg-secondary: #eef0f4;
   --text-primary: #1a1c23;
@@ -34,7 +36,7 @@
 body {
   background: var(--bg-primary);
   color: var(--text-primary);
-  font-family: 'Outfit', system-ui, sans-serif;
+  font-family: var(--font-outfit);
   min-height: 100vh;
 }
 
