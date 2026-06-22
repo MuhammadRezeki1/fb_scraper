@@ -569,7 +569,10 @@ export default function DeepSearchPage() {
   const isMyRun  = isRunning && isMyJob;
   const otherRun = isRunning && !isMyJob;
 
-  const jobPosts    = job?.type === "deep" && job.status === "done" ? (job.deepPosts as DeepPost[]) : [];
+  const jobPosts = useMemo(
+    () => (job?.type === "deep" && job.status === "done" ? (job.deepPosts as DeepPost[]) : []),
+    [job],
+  );
   const allPosts    = useMemo(
     () => (jobPosts.length > 0 ? jobPosts : posts.length > 0 ? posts : cachedPosts).filter(p => !isInvalidCachedPost(p)),
     [jobPosts, posts, cachedPosts],
@@ -760,10 +763,7 @@ export default function DeepSearchPage() {
         ? (selectedTypes.filter(t => t === "posts" || t === "videos").length
             ? selectedTypes.filter(t => t === "posts" || t === "videos")
             : ["posts", "videos"])
-        : selectedTypes;
-      if (contentMixMode === "posts_only") runTypes = runTypes.filter(t => t !== "videos");
-      if (contentMixMode === "videos_only") runTypes = ["videos"];
-      if (runTypes.length === 0) runTypes = contentMixMode === "videos_only" ? ["videos"] : ["posts"];
+        : selectedTypes;      if (runTypes.length === 0) runTypes = ["posts"];
       const commonConfig = {
         max_total: maxTotal,
         recent_days: recentDays,
@@ -1029,14 +1029,6 @@ export default function DeepSearchPage() {
               </p>
             </div>
           </div>
-
-          {jobState.progress_log?.length > 0 && (
-            <div className="rounded-xl p-4 max-h-52 overflow-y-auto font-mono text-xs space-y-0.5" style={{ background: "rgba(0,0,0,0.02)", border: "1px solid rgba(0,0,0,0.06)" }}>
-              {jobState.progress_log.map((log, idx) => (
-                <div key={idx} className="py-0.5" style={{ color: "#4a5070" }}>{log}</div>
-              ))}
-            </div>
-          )}
         </div>
       )}
 

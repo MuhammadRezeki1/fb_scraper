@@ -48,8 +48,9 @@ if __name__ == "__main__":
     print("  FB Scraper API  —  uvicorn  (backend/main.py)")
     print(f"  .env   : backend/.env")
     print(f"  Host   : {HOST}:{PORT}")
-    print(f"  URL    : http://localhost:{PORT}")
-    print(f"  Health : http://localhost:{PORT}/api/v1/health")
+    public_url = os.getenv("FB_PUBLIC_URL", f"http://{HOST}:{PORT}")
+    print(f"  URL    : {public_url}")
+    print(f"  Health : {public_url.rstrip('/')}/api/v1/health")
     print("=" * 62)
     uvicorn.run(
         "main:asgi_app",

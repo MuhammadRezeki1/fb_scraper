@@ -10,16 +10,18 @@ services:
       TZ: Asia/Jakarta
       FB_API_HOST: 0.0.0.0
       FB_API_PORT: 8003
+      FB_PUBLIC_URL: ${FB_PUBLIC_URL:-http://backend:8003}
       FB_HEADLESS: "true"
       FB_BROWSER_CHANNEL: ""
-      FB_BLOCK_HEAVY_RESOURCES: ${FB_BLOCK_HEAVY_RESOURCES:-false}
+      FB_BLOCK_HEAVY_RESOURCES: ${FB_BLOCK_HEAVY_RESOURCES:-true}
       FB_DEEP_FAST_DETAIL_ENRICH_LIMIT: ${FB_DEEP_FAST_DETAIL_ENRICH_LIMIT:-60}
       FB_DETAIL_WAIT_SECONDS: ${FB_DETAIL_WAIT_SECONDS:-2.0}
-      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      FRONTEND_URL: ${FRONTEND_URL:-http://frontend:3000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://frontend:3000}
       SENTIMENT_MODE: rule_only
       GEMINI_ENABLED: "False"
     ports:
-      - "8003:8003"
+      - "${BACKEND_PORT:-8003}:8003"
     volumes:
       - ./backend/session:/app/backend/session
       - ./backend/fb_chrome_real_profile:/app/backend/fb_chrome_real_profile
@@ -53,7 +55,7 @@ services:
       NEXT_PUBLIC_BACKEND_LABEL: ${NEXT_PUBLIC_BACKEND_LABEL:-/api/v1}
       NEXT_TELEMETRY_DISABLED: "1"
     ports:
-      - "3000:3000"
+      - "${FRONTEND_PORT:-3000}:3000"
     depends_on:
       backend:
         condition: service_healthy

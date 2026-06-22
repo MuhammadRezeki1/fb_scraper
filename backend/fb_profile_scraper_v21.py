@@ -27,13 +27,13 @@ from urllib.parse import urlparse, parse_qs, quote
 from dotenv import load_dotenv
 from colorama import Fore, init
 from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeout
-from browser_runtime import browser_channel_kwargs
+from browser_runtime import browser_channel_kwargs, fb_headless
 
 init(autoreset=True)
 load_dotenv()
 
 # ── CONFIG ────────────────────────────────────────────────────
-HEADLESS   = os.getenv("FB_HEADLESS", "False").lower() == "true"
+HEADLESS   = fb_headless(True)
 PROXY      = os.getenv("FB_PROXY", "")
 DEBUG_DUMP = os.getenv("DEBUG_DUMP", "0") == "1"
 
@@ -227,7 +227,7 @@ class FacebookProfileScraperV21:
         if self.context:
             return
 
-        print(Fore.CYAN + "\n🌐 Membuka browser Facebook (Google Chrome ASLI + stealth)...")
+        print(Fore.CYAN + "\n🌐 Menjalankan browser Facebook background (stealth)...")
         self.context = self._build_context()
         self.page    = self.context.pages[0] if self.context.pages else self.context.new_page()
 

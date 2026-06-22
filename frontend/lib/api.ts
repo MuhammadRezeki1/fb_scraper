@@ -68,7 +68,7 @@ interface JobState<T> {
   finished_at: string | null;
 }
 
-// ✅ FIX: Polling lebih smart dengan exponential backoff + null safety + console.log
+// Polling dengan exponential backoff + null safety
 async function runScrapeJob<T>(
   path: string,
   body: unknown,
@@ -88,8 +88,6 @@ async function runScrapeJob<T>(
   });
 
   const jobId = startRes.data?.job_id;
-  console.log("✅ Job created:", jobId);
-
   if (!jobId) throw new Error("Gagal memulai job scrape (job_id kosong)");
 
   const deadline = Date.now() + timeoutMs;
@@ -100,17 +98,13 @@ async function runScrapeJob<T>(
     await sleep(currentPollMs);
 
     try {
-      console.log(`🔄 Polling job ${jobId}...`);
       const res = await request<ApiResponse<JobState<T>>>(`/scrape/job/${jobId}`);
       const st = res.data;
       consecutiveErrors = 0;
 
       if (!st) {
-        console.warn("⚠️ Job status kosong");
         continue;
       }
-
-      console.log(`📊 Status: ${st.status}`);
 
       if (st.status === "done" || st.status === "completed") {
         if (st.result == null) throw new Error("Job selesai tapi hasil kosong");
@@ -118,18 +112,14 @@ async function runScrapeJob<T>(
       }
 
       if (st.status === "error") {
-        console.error("❌ Job error:", st.error);
         throw new Error(st.error || "Scrape gagal di server");
       }
 
       if (currentPollMs < maxPollMs) {
         currentPollMs = Math.min(currentPollMs * 1.2, maxPollMs);
       }
-    } catch (err: unknown) {
+    } catch {
       consecutiveErrors++;
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`❌ Polling error (${consecutiveErrors}/5):`, message);
-
       if (consecutiveErrors >= 5) {
         throw new Error(`Gagal polling status job setelah ${consecutiveErrors} percobaan`);
       }

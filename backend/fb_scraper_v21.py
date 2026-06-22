@@ -23,14 +23,14 @@ from dotenv import load_dotenv
 from colorama import Fore, init
 from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeout
 
-from browser_runtime import browser_channel_kwargs
+from browser_runtime import browser_channel_kwargs, fb_headless
 from sentiment_analyzer_v2 import SentimentAnalyzerV2
 
 init(autoreset=True)
 load_dotenv()
 
 # ── CONFIG ────────────────────────────────────────────────────
-HEADLESS               = os.getenv("FB_HEADLESS", "False").lower() == "true"
+HEADLESS               = fb_headless(True)
 PROXY                  = os.getenv("FB_PROXY", "")
 MAX_COMMENTS           = int(os.getenv("FB_MAX_COMMENTS", 200))
 DELAY_BETWEEN_REQUESTS = int(os.getenv("FB_DELAY_BETWEEN_REQUESTS", 10))
@@ -201,7 +201,7 @@ class FacebookScraperV21:
         if self.context:
             return
 
-        print(Fore.CYAN + "\n🌐 Membuka browser Facebook (Google Chrome ASLI + stealth)...")
+        print(Fore.CYAN + "\n🌐 Menjalankan browser Facebook background (stealth)...")
         self.context = self._build_context()
         self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
 

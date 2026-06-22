@@ -5,10 +5,10 @@ from urllib.parse import quote, urlparse, parse_qs
 from dotenv import load_dotenv
 from colorama import Fore, init
 from playwright.sync_api import sync_playwright, Page, BrowserContext, Response
-from browser_runtime import browser_channel_kwargs
+from browser_runtime import browser_channel_kwargs, fb_headless
 
 init(autoreset=True); load_dotenv()
-HEADLESS = os.getenv("FB_HEADLESS", "False").lower() == "true"
+HEADLESS = fb_headless(True)
 FB_CHROME_PROFILE = os.path.join(os.getcwd(), "fb_chrome_real_profile")
 FB_BLOCK_HEAVY_RESOURCES = os.getenv("FB_BLOCK_HEAVY_RESOURCES", "true").lower() == "true"
 FB_PER_TYPE_MIN = int(os.getenv("FB_PER_TYPE_MIN", "60"))
@@ -590,7 +590,7 @@ class FacebookKeywordMonitor:
 
     def initialize_browser(self):
         if self.context: return
-        print(Fore.CYAN+"\n[FB] Membuka browser...")
+        print(Fore.CYAN+"\n[FB] Menjalankan browser background...")
         self.context=self._build_context()
         self.page=self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
         try:
