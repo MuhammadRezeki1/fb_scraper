@@ -198,6 +198,21 @@ def _is_video_item(item: dict) -> bool:
     typ = (item.get("type") or "").lower()
     return typ in ("videos", "video", "reel", "reels", "watch") or _is_video_url(item.get("url", ""))
 
+def _is_search_card_url(url: str) -> bool:
+    u = (url or "").lower()
+    return "facebook.com/search/" in u and "fb_scrape_card=" in u
+
+def _text_token_overlap(left: str, right: str) -> float:
+    def toks(value: str) -> set:
+        value = re.sub(r"https?://\S+", " ", (value or "").lower())
+        return {
+            t for t in re.findall(r"[a-z0-9À-ÿ#]{3,}", value)
+            if t not in {"yang", "dan", "atau", "dengan", "untuk", "dari", "pada", "this", "that", "with"}
+        }
+    a, b = toks(left), toks(right)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / max(1, min(len(a), len(b)))
 def _keyword_in_item(item: dict, keyword: str) -> bool:
     """
     Enhanced keyword matching:
@@ -1196,10 +1211,10 @@ class FacebookKeywordMonitor:
                     else if(/\/(photo|photos)\/\d+/.test(h))score=45;
                     // ✅ FIX: tambah format share baru FB
                     else if(/\/share\/(p|v|r)\/[A-Za-z0-9_-]+/.test(h))score=48;
-                    else if(/profile\.php\?id=\d+/.test(h))score=35;
-                    else if(/facebook\.com\/[a-zA-Z0-9._-]{3,}\/?$/.test(h))score=30;
+                    else if(/profile\.php\?id=\d+/.test(h))score=-1;
+                    else if(/facebook\.com\/[a-zA-Z0-9._-]{3,}\/?(?:[?#].*)?$/.test(h))score=-1;
                     else if(/\/(reel|reels|videos|video)\/\d+/.test(h)||h.includes('/watch/?v='))score=20;
-                    else if(h.includes('facebook.com')&&!/\/(login|help|privacy|legal)/.test(h))score=10;
+                    else if(h.includes('facebook.com')&&!/\/(login|help|privacy|legal)/.test(h))score=-1;
                     if(score>bestScore){
                         const u=normalize(h);
                         if(u){best=u;bestScore=score;}
@@ -1287,7 +1302,7 @@ class FacebookKeywordMonitor:
                     r.push({url,author:author||'Unknown',text:txt.slice(0,1000),caption:txt.slice(0,1000),
                         timestamp:'',type:'posts',likes_count:likes||0,comments_count:comms||0,
                         views_count:views||0,shares_count:shares||0,images,media_urls:images,media_count:images.length,
-                        engagement_score:likes+comms*2+shares*3+views,source,source_url:sourceUrl||'',matched_via:pageQuery()?`search:${pageQuery()}`:''});
+                        engagement_score:likes+comms*2+shares*3+views,source,source_url:sourceUrl||'',matched_via:pageQuery()?`search:${pageQuery()}`:'',link_valid:source!=='search_post_card',open_url_validated:source!=='search_post_card',search_card_uid:hashText(`${author}|${txt}|${likes}|${comms}|${shares}|${views}`)});
                 }catch(e){}
             });
             return r;
@@ -1654,6 +1669,11 @@ class FacebookKeywordMonitor:
 
     def _needs_detail_enrich(self, item: dict) -> bool:
         url = item.get("url", "")
+        if _is_search_card_url(url):
+            item["link_valid"] = False
+            item["open_url_validated"] = False
+            item.setdefault("link_sync_error", "search_card_has_no_permalink")
+            return False
         if not _is_commentable_url(url):
             return False
         text_missing = not (item.get("caption") or item.get("text") or "").strip()
@@ -1663,12 +1683,13 @@ class FacebookKeywordMonitor:
             or _metric_value(item.get("shares_count")) == 0
         )
         is_video = _is_video_item(item)
-        return text_missing or (is_video and not item.get("metrics_valid")) or (is_video and core_missing) or (
+        source = (item.get("source") or "").lower()
+        search_only_source = source in {"dom", "generic", "generic_article", "html_embedded"}
+        return search_only_source or text_missing or (is_video and not item.get("metrics_valid")) or (is_video and core_missing) or (
             _metric_value(item.get("likes_count")) == 0
             and _metric_value(item.get("comments_count")) == 0
             and _metric_value(item.get("shares_count")) == 0
         )
-
     def safe_goto(self, page: Page, url: str, timeout=45000, retries=3) -> dict:
         last_error = None
         for attempt in range(1, retries + 1):
@@ -2052,6 +2073,18 @@ class FacebookKeywordMonitor:
                         except Exception:
                             pass
                     meta = self._extract_detail_metadata(tab)
+                    final_url = post.get("detail_final_url") or getattr(tab, "url", "") or ""
+                    if final_url:
+                        post["detail_final_url"] = final_url
+                    input_key = _fb_content_key(url)
+                    final_key = _fb_content_key(final_url)
+                    if input_key and final_key and input_key != final_key and "/share/" not in (url or "").lower():
+                        post["link_valid"] = False
+                        post["open_url_validated"] = False
+                        post["link_sync_error"] = f"detail_final_url_mismatch:{input_key}->{final_key}"
+                    else:
+                        post["link_valid"] = True
+                        post["open_url_validated"] = True
                     if not is_video:
                         for src_key, dst_key in [
                             ("likes_count", "likes_count"),
@@ -2073,9 +2106,17 @@ class FacebookKeywordMonitor:
                             post["metric_source"] = "detail_page"
                     caption = (meta.get("caption") or "").strip()
                     current = (post.get("caption") or post.get("text") or "").strip()
-                    if caption and (not current or len(caption) > len(current)):
-                        post["caption"] = caption[:1000]
-                        post["text"] = caption[:1000]
+                    if caption:
+                        overlap = _text_token_overlap(current, caption) if current else 0.0
+                        search_only_source = (post.get("source") or "").lower() in {"dom", "generic", "generic_article", "html_embedded"}
+                        if current and search_only_source and overlap < 0.28:
+                            post["search_caption_mismatch"] = True
+                            post["search_caption_before_detail"] = current[:500]
+                            post["caption_match_score"] = round(overlap, 3)
+                        if (not current) or search_only_source or len(caption) > len(current):
+                            post["caption"] = caption[:1000]
+                            post["text"] = caption[:1000]
+                            post["caption_source"] = "detail_page"
                     author = (meta.get("author") or "").strip()
                     current_author = str(post.get("author") or "")
                     if author and (current_author in ("", "Unknown") or re.match(r"^\d{1,2}:\d{2}(?::\d{2})?$", current_author)):

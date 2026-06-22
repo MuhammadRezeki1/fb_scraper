@@ -770,6 +770,12 @@ export interface DeepPost {
   metrics_error?: string | null;
   detail_status?: string;
   detail_final_url?: string;
+  link_valid?: boolean;
+  open_url_validated?: boolean;
+  link_sync_error?: string;
+  search_caption_mismatch?: boolean;
+  caption_match_score?: number;
+  caption_source?: string;
   metric_patterns?: Record<string, string>;
   viral_score?: number;
   viral_level?: "unknown" | "low" | "potential" | "viral" | "strong_viral" | "very_viral";

@@ -112,6 +112,67 @@ def main():
         }""")
         print(f"\nFeed item link debug:\n{json.dumps(feed_items, ensure_ascii=False, indent=2)[:12000]}")
 
+        # Robust card/link alignment debug
+        alignment = page.evaluate(r"""() => {
+            const clean = (text) => (text || '').replace(/\u00a0|\xa0/g, ' ').replace(/\s+/g, ' ').trim();
+            const hashText = (text) => {
+                let h = 2166136261;
+                for (const ch of (text || '')) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619); }
+                return (h >>> 0).toString(36);
+            };
+            const normalize = (href) => {
+                if (!href) return '';
+                let raw = href;
+                if (raw.startsWith('http')) {
+                    try { const u = new URL(raw); raw = u.pathname + u.search; } catch(e) {}
+                }
+                if (!raw.startsWith('/')) raw = '/' + raw;
+                if (raw.includes('/stories/')) return '';
+                if (/\/share\/(p|v|r)\/([A-Za-z0-9_-]+)/.test(raw)) return 'https://www.facebook.com' + raw.split('#')[0].split('?')[0];
+                if (raw.includes('/watch') && /[?&]v=\d+/.test(raw)) return 'https://www.facebook.com/watch/?v=' + raw.match(/[?&]v=(\d+)/)[1];
+                if (raw.includes('story_fbid=')) {
+                    const story = raw.match(/story_fbid=(\d+)/);
+                    const owner = raw.match(/[?&]id=(\d+)/);
+                    if (story) return 'https://www.facebook.com/profile.php?story_fbid=' + story[1] + (owner ? '&id=' + owner[1] : '');
+                }
+                if (raw.includes('/photo/') && raw.includes('fbid=')) return 'https://www.facebook.com/photo/?fbid=' + raw.match(/[?&]fbid=(\d+)/)[1];
+                if (/profile\.php\?id=\d+/.test(raw)) return '';
+                raw = raw.split('#')[0].split('?')[0];
+                return 'https://www.facebook.com' + raw;
+            };
+            const scoreHref = (h) => {
+                if (!h || h.includes('/stories/')) return -1;
+                if (/\/groups\/[^/]+\/(posts|permalink)\/\d+/.test(h)) return 60;
+                if (/\/(posts|permalink)\/(\d+|pfbid)/.test(h)) return 55;
+                if ((h.includes('/photo/') || h.includes('/photo?')) && h.includes('fbid=')) return 50;
+                if (/\/share\/(p|v|r)\/[A-Za-z0-9_-]+/.test(h)) return 48;
+                if (/\/(photo|photos)\/\d+/.test(h)) return 45;
+                if (/\/(reel|reels|videos|video)\/\d+/.test(h) || (h.includes('/watch') && /[?&]v=\d+/.test(h))) return 20;
+                return -1;
+            };
+            const cards = [
+                ...document.querySelectorAll('[role="feed"] [aria-posinset]'),
+                ...document.querySelectorAll('[role="feed"] [role="article"]'),
+                ...document.querySelectorAll('[role="article"]')
+            ];
+            const seen = new Set();
+            return cards.filter(c => { if (seen.has(c)) return false; seen.add(c); return true; }).slice(0, 20).map((card, idx) => {
+                const links = [...card.querySelectorAll('a[href]')].map(a => {
+                    const href = a.getAttribute('href') || '';
+                    return { href, text: clean(a.innerText || a.getAttribute('aria-label') || '').slice(0, 120), score: scoreHref(href), normalized: normalize(href) };
+                }).filter(x => x.href).sort((a,b) => b.score - a.score).slice(0, 20);
+                const lines = clean(card.innerText || '').split(/\n+/).map(clean).filter(Boolean);
+                const caption = lines.filter(x => x.length > 12 && !/^(suka|komentar|bagikan|like|comment|share)$/i.test(x)).sort((a,b) => b.length - a.length)[0] || '';
+                const best = links.find(x => x.score >= 0 && x.normalized) || null;
+                return { idx, uid: hashText(caption + '|' + (best?.normalized || '')), selected: best, caption: caption.slice(0, 500), links };
+            });
+        }""")
+        os.makedirs("fb_keyword_debug", exist_ok=True)
+        align_path = os.path.join("fb_keyword_debug", f"search_alignment_{keyword}_{int(time.time())}.json")
+        with open(align_path, "w", encoding="utf-8") as fh:
+            json.dump(alignment, fh, ensure_ascii=False, indent=2)
+        print(f"\nAlignment debug saved: {align_path}")
+        print(json.dumps(alignment[:5], ensure_ascii=False, indent=2)[:8000])
         # Test 2: Hashtag page
         print(f"\n\n=== TEST 2: Hashtag Page ===")
         hashtag_url = f"https://www.facebook.com/hashtag/{quote(keyword)}"

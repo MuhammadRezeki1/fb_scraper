@@ -36,6 +36,7 @@ DEFAULT_FAST_MAX_RELATED = int(os.getenv("FB_DEEP_FAST_MAX_RELATED", "2"))
 DEFAULT_FAST_RELATED_LIMIT = int(os.getenv("FB_DEEP_FAST_RELATED_LIMIT", "60"))
 DEFAULT_FAST_ROOT_LIMIT = int(os.getenv("FB_DEEP_FAST_ROOT_LIMIT", "100"))
 DEFAULT_FAST_DETAIL_ENRICH_LIMIT = int(os.getenv("FB_DEEP_FAST_DETAIL_ENRICH_LIMIT", "12"))
+DEFAULT_POST_DETAIL_VALIDATE_LIMIT = int(os.getenv("FB_POST_DETAIL_VALIDATE_LIMIT", "80"))
 FAST_TYPES = {"posts", "videos"}
 
 os.makedirs(_JOBS_DIR,  exist_ok=True)
@@ -834,6 +835,34 @@ def _merge_posts(new_posts: list, seen: set, posts: list,
     return added
 
 
+def _second_pass_post_link_validation(job_id: str, monitor, posts: list, config: dict):
+    if not posts:
+        return
+    try:
+        limit = int(config.get("post_detail_validate_limit", DEFAULT_POST_DETAIL_VALIDATE_LIMIT))
+    except Exception:
+        limit = DEFAULT_POST_DETAIL_VALIDATE_LIMIT
+    if limit <= 0:
+        return
+    targets = [
+        p for p in posts
+        if not _is_video_result(p)
+        and _accept_result_item(p, p.get("url") or p.get("cleanHref") or "")
+        and "fb_scrape_card=" not in (p.get("url") or "").lower()
+        and (p.get("source") or "").lower() in {"dom", "generic", "generic_article", "html_embedded"}
+    ]
+    if not targets:
+        return
+    limit = min(limit, len(targets))
+    _log_progress(job_id, f"Second-pass validasi link/caption post: {limit}/{len(targets)}")
+    monitor.enrich_missing_details(
+        targets,
+        limit=limit,
+        progress_callback=lambda msg: _log_progress(job_id, f"Post-detail {msg}"),
+    )
+    for item in posts:
+        _assign_viral_fields_local(item)
+    _write_posts(job_id, posts)
 def _second_pass_video_metrics(job_id: str, monitor, posts: list, config: dict):
     if not posts:
         return
@@ -983,6 +1012,7 @@ def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
         if not posts and auth_failed:
             raise RuntimeError(_session_error_message())
         _second_pass_video_metrics(job_id, monitor, posts, config)
+        _second_pass_post_link_validation(job_id, monitor, posts, config)
         if max_comments_per_post > 0 and posts:
             _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
             monitor.enrich_comments(
@@ -1041,6 +1071,7 @@ def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
         if not posts and auth_failed:
             raise RuntimeError(_session_error_message())
         _second_pass_video_metrics(job_id, monitor, posts, config)
+        _second_pass_post_link_validation(job_id, monitor, posts, config)
         if max_comments_per_post > 0 and posts:
             _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
             monitor.enrich_comments(
@@ -1106,6 +1137,7 @@ def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
     if not posts and auth_failed:
         raise RuntimeError(_session_error_message())
     _second_pass_video_metrics(job_id, monitor, posts, config)
+    _second_pass_post_link_validation(job_id, monitor, posts, config)
     if max_comments_per_post > 0 and posts:
         _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
         monitor.enrich_comments(
@@ -1209,6 +1241,7 @@ def _worker_hashtag(job_id: str, tag: str, config: dict, monitor):
         if not posts and auth_failed:
             raise RuntimeError(_session_error_message())
         _second_pass_video_metrics(job_id, monitor, posts, config)
+        _second_pass_post_link_validation(job_id, monitor, posts, config)
         if max_comments_per_post > 0 and posts:
             _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
             monitor.enrich_comments(
@@ -1277,6 +1310,7 @@ def _worker_hashtag(job_id: str, tag: str, config: dict, monitor):
     if not posts and auth_failed:
         raise RuntimeError(_session_error_message())
     _second_pass_video_metrics(job_id, monitor, posts, config)
+    _second_pass_post_link_validation(job_id, monitor, posts, config)
     if max_comments_per_post > 0 and posts:
         _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
         monitor.enrich_comments(
@@ -1382,6 +1416,7 @@ def _worker_trending(job_id: str, query: str, config: dict, monitor):
     if not posts and auth_failed:
         raise RuntimeError(_session_error_message())
     _second_pass_video_metrics(job_id, monitor, posts, config)
+    _second_pass_post_link_validation(job_id, monitor, posts, config)
     if max_comments_per_post > 0 and posts:
         _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
         monitor.enrich_comments(

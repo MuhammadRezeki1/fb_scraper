@@ -338,7 +338,9 @@ function CommentSection({ post }: { post: DeepPost }) {
 
 function PostCard({ post, idx, onScrapePost }: { post: DeepPost; idx: number; onScrapePost: (url: string) => void }) {
   const text       = primaryText(post);
-  const domain     = mediaDomain(post.url);
+  const openUrl = isRealPostLink(post.detail_final_url) ? post.detail_final_url! : post.url;
+  const canOpenFb = isRealPostLink(openUrl) && post.link_valid !== false;
+  const domain     = mediaDomain(openUrl || post.url);
   const realPost   = isRealPost(post);
   const hasContent_ = hasContent(post);
   const hasEngage  = hasEngagement(post);
@@ -484,20 +486,32 @@ function PostCard({ post, idx, onScrapePost }: { post: DeepPost; idx: number; on
 
         {/* ── Right: Actions ── */}
         <div className="flex shrink-0 flex-row gap-1.5 lg:w-32 lg:flex-col">
-          <a
-            href={post.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex-1 lg:flex-none flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium transition-all hover:bg-purple-50"
-            style={{ color: "#6b5ec7", border: "1px solid rgba(107,94,199,0.2)", background: "rgba(107,94,199,0.05)" }}
-          >
-            <ExternalLink size={12} /> Buka FB
-          </a>
+          {canOpenFb ? (
+            <a
+              href={openUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex-1 lg:flex-none flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium transition-all hover:bg-purple-50"
+              style={{ color: "#6b5ec7", border: "1px solid rgba(107,94,199,0.2)", background: "rgba(107,94,199,0.05)" }}
+            >
+              <ExternalLink size={12} /> Buka FB
+            </a>
+          ) : (
+            <button
+              type="button"
+              disabled
+              title={post.link_sync_error || "Permalink asli belum tervalidasi dari hasil pencarian Facebook"}
+              className="flex-1 lg:flex-none flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium disabled:cursor-not-allowed disabled:opacity-45"
+              style={{ color: "#4a5070", border: "1px solid rgba(74,80,112,0.16)", background: "rgba(74,80,112,0.04)" }}
+            >
+              <ExternalLink size={12} /> Link belum valid
+            </button>
+          )}
           {(() => {
-            const canScrape = isRealPostLink(post.url);
+            const canScrape = canOpenFb;
             return (
               <button
-                onClick={() => canScrape && onScrapePost(post.url)}
+                onClick={() => canScrape && onScrapePost(openUrl)}
                 disabled={!canScrape}
                 title={canScrape
                   ? "Scrape detail postingan ini"
