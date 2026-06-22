@@ -158,7 +158,7 @@ def _is_valid_result_url(url):
         return True
 
     # Photo dengan fbid
-    if 'facebook.com/photo/?fbid=' in u or re.search(r'/photo/\?fbid=\d+', u):
+    if 'facebook.com/photo/?fbid=' in u or 'facebook.com/photo?fbid=' in u or re.search(r'/photo/?\?fbid=\d+', u):
         return True
     # Watch video, including live permalink surface.
     if '/watch' in u and re.search(r'[?&]v=\d+', u):
@@ -291,6 +291,13 @@ def _normalize_fb_url(url: str) -> str:
         if "facebook.com" in host:
             path = parsed.path or ""
             qs = parse_qs(parsed.query or "")
+            story_id = (qs.get("story_fbid") or [""])[0]
+            owner_id = (qs.get("id") or [""])[0]
+            if story_id:
+                return f"https://www.facebook.com/profile.php?story_fbid={story_id}" + (f"&id={owner_id}" if owner_id else "")
+            photo_id = (qs.get("fbid") or [""])[0]
+            if photo_id and "/photo" in path:
+                return f"https://www.facebook.com/photo/?fbid={photo_id}"
             video_id = (qs.get("v") or [""])[0]
             if video_id and "/watch" in path:
                 return f"https://www.facebook.com/watch/?v={video_id}"
@@ -1184,7 +1191,7 @@ class FacebookKeywordMonitor:
                     const m=raw.match(/[?&]v=(\d+)/);
                     if(m)return 'https://www.facebook.com/watch/?v='+m[1];
                 }
-                if(raw.includes('/photo/')&&raw.includes('fbid=')){
+                if((raw.includes('/photo/')||raw.includes('/photo?'))&&raw.includes('fbid=')){
                     const m=raw.match(/[?&]fbid=(\d+)/);
                     if(m)return 'https://www.facebook.com/photo/?fbid='+m[1];
                 }
@@ -1206,7 +1213,7 @@ class FacebookKeywordMonitor:
                     if(!h||h.includes('/stories/'))continue;
                     let score=-1;
                     if(/\/groups\/[^/]+\/(posts|permalink)\/\d+/.test(h))score=60;
-                    else if(/\/(posts|permalink)\/\d+/.test(h))score=55;
+                    else if(/\/(posts|permalink)\/(?:\d+|pfbid[A-Za-z0-9_-]+)/.test(h))score=55;
                     else if((h.includes('/photo/')||h.includes('/photo?'))&&h.includes('fbid='))score=50;
                     else if(/\/(photo|photos)\/\d+/.test(h))score=45;
                     // ✅ FIX: tambah format share baru FB
@@ -1222,7 +1229,34 @@ class FacebookKeywordMonitor:
                 }
                 return best||'';
             };
-            // ✅ FIX: selector lebih luas — cover semua variasi struktur FB feed + article fallback
+            const recoverContentUrl=(node)=>{
+                const html=(node?.outerHTML||'').replace(/&amp;/g,'&').replace(/\\\//g,'/').replace(/\u0025/g,'%');
+                const patterns=[
+                    /https?:\/\/www\.facebook\.com\/groups\/[^"'<>\s]+\/(?:posts|permalink)\/\d+/i,
+                    /https?:\/\/www\.facebook\.com\/[^"'<>\s]+\/(?:posts|permalink)\/(?:\d+|pfbid[A-Za-z0-9_-]+)/i,
+                    /https?:\/\/www\.facebook\.com\/photo\/?\?fbid=\d+/i,
+                    /https?:\/\/www\.facebook\.com\/share\/(?:p|v|r)\/[A-Za-z0-9_-]+/i,
+                    /\/groups\/[^"'<>\s]+\/(?:posts|permalink)\/\d+/i,
+                    /\/[^"'<>\s]+\/(?:posts|permalink)\/(?:\d+|pfbid[A-Za-z0-9_-]+)/i,
+                    /\/photo\/?\?fbid=\d+/i,
+                    /\/share\/(?:p|v|r)\/[A-Za-z0-9_-]+/i,
+                    /\/watch\/?\?v=\d+/i,
+                    /\/(?:reel|reels|videos|video)\/\d+/i,
+                ];
+                for(const pat of patterns){
+                    const m=html.match(pat);
+                    if(m){
+                        const u=normalize(m[0]);
+                        if(u&&isSpecificFbUrl(u))return u;
+                    }
+                }
+                const story=html.match(/story_fbid["'=:%&;\\]+(\d{8,})/i);
+                if(story){
+                    const owner=html.match(/(?:actorID|actor_id|ownerID|owner_id|profile_id|__user|id)["'=:%&;\\]+(\d{6,})/i);
+                    return 'https://www.facebook.com/profile.php?story_fbid='+story[1]+(owner?'&id='+owner[1]:'');
+                }
+                return '';
+            };            // ✅ FIX: selector lebih luas — cover semua variasi struktur FB feed + article fallback
             const feedContainers=[
                 ...document.querySelectorAll('[role="feed"] [aria-posinset]'),
                 ...document.querySelectorAll('[role="feed"] [role="article"]'),
@@ -1237,6 +1271,7 @@ class FacebookKeywordMonitor:
                 try{
                     const ls=c.querySelectorAll('a[href*="/"]');
                     let url=pickContentUrl(ls),author='',txt='';
+                    if(!url)url=recoverContentUrl(c);
                     const sourceUrl=url||pickAuthorUrl(ls);
                     author=pickAuthorName(ls);
                     const ac=c.querySelector('a[role="link"] span[dir="auto"],strong[dir="auto"] > span[dir="auto"],h2 span[dir="auto"],h3 span[dir="auto"],h4 span[dir="auto"]');
@@ -1401,7 +1436,7 @@ class FacebookKeywordMonitor:
                 if(/\/share\/(p|v|r)\/[A-Za-z0-9_-]+/.test(raw)){
                     return 'https://www.facebook.com'+raw.split('#')[0].split('?')[0];
                 }
-                if(raw.includes('/photo/')&&raw.includes('fbid=')){
+                if((raw.includes('/photo/')||raw.includes('/photo?'))&&raw.includes('fbid=')){
                     const m=raw.match(/[?&]fbid=(\d+)/);
                     if(m)return 'https://www.facebook.com/photo/?fbid='+m[1];
                 }
@@ -1423,7 +1458,7 @@ class FacebookKeywordMonitor:
                     const h=x.getAttribute('href')||'';
                     // ✅ FIX: cek /watch dengan v= param di posisi manapun
                     const isWatch=h.includes('/watch')&&/[?&]v=\d/.test(h);
-                    if(!h.includes('/stories/')&&(/\/(posts|permalink|photo|videos|video|reel|reels)\/\d+/.test(h)||isWatch||(h.includes('/photo/')&&h.includes('fbid='))))n++;
+                    if(!h.includes('/stories/')&&(/\/(posts|permalink)\/(?:\d+|pfbid[A-Za-z0-9_-]+)/.test(h)||/\/(photo|photos|videos|video|reel|reels)\/\d+/.test(h)||isWatch||((h.includes('/photo/')||h.includes('/photo?'))&&h.includes('fbid='))))n++;
                 });
                 return n;
             };
@@ -1526,7 +1561,7 @@ class FacebookKeywordMonitor:
                         }
                     }
                     if(st==='posts'){
-                        if(/(posts|permalink|photo)\/\d+/.test(ch)||(h.includes('/photo/')&&h.includes('fbid='))){
+                        if(/(posts|permalink)\/(?:\d+|pfbid[A-Za-z0-9_-]+)/.test(ch)||/photo\/\d+/.test(ch)||((h.includes('/photo/')||h.includes('/photo?'))&&h.includes('fbid='))){
                             url=normalizeUrl(h);detected='posts';
                         }
                     }
@@ -1794,6 +1829,88 @@ class FacebookKeywordMonitor:
             except Exception:
                 return []
 
+    def _extract_primary_detail_counts(self, page: Page) -> Optional[dict]:
+        """Scope-locked metric read for the ACTIVE video/reel only.
+
+        Two real FB layouts (verified live via debug_views_bug.py / debug_reel_rail.py):
+          * /watch & video permalinks -> ONE horizontal engagement row:
+            "Suka Komentari Bagikan <likes> · <comments> komentar · <views> tayangan".
+          * /reel -> a vertical action rail where the count sits on the FIRST
+            Suka/Komentari/Bagikan buttons. Reels rendered below belong to OTHER clips
+            in the feed, so only the topmost (active) rail may be read.
+
+        Returning the metrics as one coherent set kills the old bug where a page-wide
+        max scan grabbed a neighbouring 'suggested video' count (e.g. 333 rb views /
+        5,3 rb likes from another clip instead of the real 34 rb / 881)."""
+        try:
+            return page.evaluate(r"""
+            () => {
+                const clean = (t) => (t || '').replace(/ |\xa0|Â|Ã‚|�/g, ' ').replace(/\s+/g, ' ').trim();
+                const parseNum = (text) => {
+                    const m = clean(text).toLowerCase().match(/([\d]+(?:[.,][\d]+)?)\s*(ribu|juta|mio|mn|rb|jt|k|m)?(?![a-z])/i);
+                    if (!m) return null;
+                    let n = parseFloat(m[1].replace(/\./g, '').replace(',', '.'));
+                    if (Number.isNaN(n)) return null;
+                    const sf = (m[2] || '').toLowerCase();
+                    if (sf === 'k' || sf === 'rb' || sf === 'ribu') n *= 1000;
+                    else if (sf === 'm' || sf === 'jt' || sf === 'juta' || sf === 'mio' || sf === 'mn') n *= 1000000;
+                    return Math.floor(n);
+                };
+
+                // ── A) Horizontal engagement row (watch / video permalinks). The active
+                //       video sits first in [role=main]/[role=article], so the FIRST row
+                //       match belongs to it, never to the suggested-video feed below. ──
+                const scopes = [document.querySelector('[role="main"]'), ...document.querySelectorAll('[role="article"]')].filter(Boolean);
+                const scopedText = (scopes.map(el => clean(el.innerText || '')).filter(Boolean).join('\n')) || clean(document.body.innerText || '');
+                const rowFull = scopedText.match(/(?:\bSuka\b|\bLike\b)\s+(?:Komentari|Comment)\s+(?:Bagikan|Share)\s+([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:[^\w\d]+)\s*([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:komentar|comments?)\s*(?:[^\w\d]+)\s*([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:tayangan|views?|ditonton|viewed)/i);
+                if (rowFull) {
+                    return {likes: parseNum(rowFull[1]), comments: parseNum(rowFull[2]), shares: null, views: parseNum(rowFull[3]), source: 'detail_engagement_row', matched: clean(rowFull[0]).slice(0, 160)};
+                }
+                const rowNoLikes = scopedText.match(/(?:\bSuka\b|\bLike\b)\s+(?:Komentari|Comment)\s+(?:Bagikan|Share)\s*(?:[^\w\d]+)\s*([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:komentar|comments?)\s*(?:[^\w\d]+)\s*([\d][\d.,]*\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?)\s*(?:tayangan|views?|ditonton|viewed)/i);
+                if (rowNoLikes) {
+                    return {likes: null, comments: parseNum(rowNoLikes[1]), shares: null, views: parseNum(rowNoLikes[2]), source: 'detail_engagement_row_nolikes', matched: clean(rowNoLikes[0]).slice(0, 160)};
+                }
+
+                // ── B) Vertical reel action rail: read the count co-located with the
+                //       FIRST (topmost = active) Suka/Komentari/Bagikan button. ──
+                const isNum = /^\d+(?:[.,]\d+)?\s*(?:rb|ribu|k|jt|juta|m|mio|mn)?$/i;
+                const numbers = [];
+                document.querySelectorAll('span,div').forEach(el => {
+                    if (el.children.length) return;            // leaf text nodes only
+                    const t = clean(el.innerText || el.textContent || '');
+                    if (!isNum.test(t) || t.length > 8) return;
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 && r.height === 0) return;
+                    numbers.push({v: parseNum(t), cx: r.x + r.width / 2, cy: r.y + r.height / 2});
+                });
+                const btns = [...document.querySelectorAll('[role="button"][aria-label]')].map(el => {
+                    const r = el.getBoundingClientRect();
+                    return {a: clean(el.getAttribute('aria-label')).toLowerCase(), cx: r.x + r.width / 2, cy: r.y + r.height / 2, vis: r.width > 0 || r.height > 0};
+                }).filter(b => b.vis);
+                const firstBtn = (names) => btns.filter(b => names.some(n => b.a === n)).sort((x, y) => x.cy - y.cy)[0];
+                const countNear = (btn) => {
+                    if (!btn) return null;
+                    let best = null, bestD = 26;               // own count is co-located (~0-15px); neighbour ~30px+
+                    for (const n of numbers) {
+                        if (n.v === null || Math.abs(n.cx - btn.cx) > 36) continue;
+                        const d = Math.hypot(n.cx - btn.cx, n.cy - btn.cy);
+                        if (d < bestD) { bestD = d; best = n.v; }
+                    }
+                    return best;
+                };
+                const likes = countNear(firstBtn(['suka', 'beri reaksi', 'like']));
+                const comments = countNear(firstBtn(['komentari', 'comment']));
+                const shares = countNear(firstBtn(['bagikan', 'share']));
+                if (likes !== null || comments !== null || shares !== null) {
+                    return {likes, comments, shares, views: null, source: 'reel_action_rail', matched: 'rail L=' + likes + ' C=' + comments + ' S=' + shares};
+                }
+                return null;
+            }
+            """)
+        except Exception as e:
+            print(Fore.YELLOW+f"     [DETAIL] primary-count extract error: {e}")
+            return None
+
     def extract_detail_metrics(self, page: Page, url: str) -> dict:
         nav = self.safe_goto(page, url, timeout=45000, retries=3)
         out = {
@@ -1834,9 +1951,24 @@ class FacebookKeywordMonitor:
                 "shares": None,
                 "matched_patterns": {},
             }
+            # Authoritative pass: lock onto the ACTIVE video/reel's own counts so the
+            # page-wide candidate scan below can never override them with a sibling
+            # suggested-video number. Fields it resolves are "locked".
+            locked = set()
+            primary = self._extract_primary_detail_counts(page)
+            if primary:
+                for src, field in (("likes", "likes"), ("comments", "comments"), ("shares", "shares"), ("views", "views")):
+                    value = primary.get(src)
+                    if value is not None:
+                        metrics[field] = int(value)
+                        metrics["matched_patterns"][field] = f"{primary.get('source', 'primary')}:{primary.get('matched', '')}"[:160]
+                        locked.add(field)
+            # Fallback: page-wide text candidates only FILL fields still unresolved.
             for candidate in candidates:
                 found = extract_video_metrics_from_text(candidate)
                 for field in ("views", "likes", "comments", "shares"):
+                    if field in locked:
+                        continue
                     value = found.get(field)
                     if value is None:
                         continue
@@ -1882,7 +2014,7 @@ class FacebookKeywordMonitor:
         try:
             return page.evaluate(r"""
             () => {
-                const out = {likes_count: 0, comments_count: 0, shares_count: 0, views_count: 0, caption: '', author: ''};
+                const out = {likes_count: 0, comments_count: 0, shares_count: 0, views_count: 0, caption: '', author: '', caption_reliable: false};
                 const clean = (text) => (text || '').replace(/\u00a0|\xa0|Â|�/g, ' ').replace(/\s+/g, ' ').trim();
                 const parseNum = (text) => {
                     const m = clean(text).toLowerCase().match(/([\d]+(?:[.,][\d]+)?)(?:\s*(ribu|juta|mio|mn|rb|jt|k|m)(?![a-z]))?/i);
@@ -1970,27 +2102,62 @@ class FacebookKeywordMonitor:
                 inferVideoEngagementRow();
 
                 const chrome = /(notifikasi|belum dibaca|lihat semua|orang yang anda kenal|saran teman|selamat datang|welcome to facebook|masuk ke facebook|log in to facebook|filter|hasil pencarian|tanggal diposting|marketplace|halaman|grup|acara)/i;
-                const metricish = /^([\d.,]+\s*(rb|ribu|k|jt|juta|m|mio|mn)?|[\d:]+|suka|komentar|bagikan|share|like|comment)$/i;
-                const okCaption = (t) => t && t.length >= 8 && t.length < 2200 && !chrome.test(t) && !metricish.test(t);
+                const pureMetric = /^([\d.,]+\s*(rb|ribu|k|jt|juta|m|mio|mn)?\s*(komentar|comments?|tayangan|views?|ditonton|suka|likes?|reaksi|reactions?|kali dibagikan|dibagikan|shares?))$/i;
+                const metricish = /^([\d.,]+\s*(rb|ribu|k|jt|juta|m|mio|mn)?|[\d:]+|sukai?|komentari?|bagikan|kirim|share|like|comment|send)$/i;
+                const okCaption = (t) => t && t.length >= 8 && t.length < 2200 && !chrome.test(t) && !metricish.test(t) && !pureMetric.test(t);
+
+                // ── PRIMARY caption: the substantive line right before the ACTIVE clip's
+                //    engagement controls ("Suka / Komentari / Bagikan"). Verified live via
+                //    debug_caption_bug.py: og tags are empty on /watch, so the old
+                //    "longest line on the page" grabbed comments or a sibling clip's caption.
+                //    The active video's own caption always sits just above its action row. ──
+                const captionFromRow = () => {
+                    const mainEl = document.querySelector('[role="main"]') || document.body;
+                    const lines = (mainEl.innerText || '').split(/\n+/).map(clean).filter(Boolean);
+                    let rowIdx = -1;
+                    for (let i = 0; i < lines.length; i++) {
+                        if (/(?:^|\s)(?:suka|like)\b.*\b(?:komentari|comment)\b.*\b(?:bagikan|share)\b/i.test(lines[i])) { rowIdx = i; break; }
+                        if (/^(?:suka|like)$/i.test(lines[i]) && i + 2 < lines.length && /^(?:komentari|comment)$/i.test(lines[i + 1]) && /^(?:bagikan|share)$/i.test(lines[i + 2])) { rowIdx = i; break; }
+                    }
+                    if (rowIdx <= 0) return '';
+                    const skip = (t) => !t
+                        || /^\d{1,2}:\d{2}(?::\d{2})?(?:\s*\/\s*\d{1,2}:\d{2}(?::\d{2})?)?$/.test(t)
+                        || /^(?:lihat selengkapnya|selengkapnya|see more|lihat terjemahan|see translation|aktif|active)$/i.test(t)
+                        || /^(?:suka|komentari|bagikan|like|comment|share|kirim|send)$/i.test(t)
+                        || (/(?:·|ikuti|follow|diverifikasi)/i.test(t) && t.length < 45)
+                        || metricish.test(t) || pureMetric.test(t);
+                    for (let j = rowIdx - 1; j >= 0 && j >= rowIdx - 7; j--) {
+                        if (skip(lines[j])) continue;
+                        // Require real caption text (>= 2 words) so a bare author/page name
+                        // sitting just above the row (e.g. "Kompas.com") is not taken as caption.
+                        if (okCaption(lines[j]) && /\S\s+\S/.test(lines[j])) return lines[j];
+                    }
+                    return '';
+                };
+                const rowCaption = captionFromRow();
+                if (rowCaption) { out.caption = rowCaption; out.caption_reliable = true; }
 
                 const og = clean(document.querySelector('meta[property="og:description"],meta[name="description"]')?.getAttribute('content') || '');
-                if (okCaption(og)) out.caption = og;
+                if (!out.caption && okCaption(og)) { out.caption = og; out.caption_reliable = true; }
 
                 if (!out.caption) {
                     const selectors = ['[data-ad-preview="message"]', '[data-ad-comet-preview="message"]', '[data-testid="post_message"]'];
                     for (const sel of selectors) {
                         const text = clean(document.querySelector(sel)?.textContent || '');
-                        if (okCaption(text)) { out.caption = text; break; }
+                        if (okCaption(text)) { out.caption = text; out.caption_reliable = true; break; }
                     }
                 }
 
                 if (!out.caption) {
+                    // Low-confidence fallback (caption_reliable stays false): only used by the
+                    // caller for non-video posts, where the page is a single post not a feed.
                     let best = '';
                     document.querySelectorAll('[role="article"], [role="main"], [role="complementary"]').forEach(scope => {
                         const lines = (scope.innerText || '').split(/\n+/).map(clean).filter(Boolean);
                         for (const line of lines) {
                             if (!okCaption(line)) continue;
                             if (/durasi video|diverifikasi|yang lalu|\btayangan\b/i.test(line)) continue;
+                            if (/^\d{1,2}:\d{2}(?::\d{2})?(?:\s*\/\s*\d{1,2}:\d{2}(?::\d{2})?)?$/.test(line)) continue;
                             if (line.length > best.length) best = line;
                         }
                     });
@@ -2105,6 +2272,7 @@ class FacebookKeywordMonitor:
                             post["metrics_unverified"] = False
                             post["metric_source"] = "detail_page"
                     caption = (meta.get("caption") or "").strip()
+                    caption_reliable = bool(meta.get("caption_reliable"))
                     current = (post.get("caption") or post.get("text") or "").strip()
                     if caption:
                         overlap = _text_token_overlap(current, caption) if current else 0.0
@@ -2113,7 +2281,12 @@ class FacebookKeywordMonitor:
                             post["search_caption_mismatch"] = True
                             post["search_caption_before_detail"] = current[:500]
                             post["caption_match_score"] = round(overlap, 3)
-                        if (not current) or search_only_source or len(caption) > len(current):
+                        # /watch is a feed: only adopt the detail caption when it was anchored
+                        # to the ACTIVE clip (caption_reliable). For a video whose detail caption
+                        # is the low-confidence longest-line fallback, keep the search-card caption
+                        # (bound to this URL at scrape time) instead of a sibling/comment text.
+                        trust_detail = caption_reliable or not is_video
+                        if trust_detail and ((not current) or search_only_source or len(caption) > len(current)):
                             post["caption"] = caption[:1000]
                             post["text"] = caption[:1000]
                             post["caption_source"] = "detail_page"

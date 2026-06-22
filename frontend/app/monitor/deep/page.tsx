@@ -113,6 +113,15 @@ function isRealPostLink(url?: string): boolean {
   );
 }
 
+// Filter defensif: jangan tampilkan item dari cache lama yang link-nya invalid.
+// Backend sekarang sudah drop placeholder kartu pencarian + item link_valid=false,
+// tapi cache "deep-posts-v2" di browser bisa berisi data lama sebelum fix ini.
+function isInvalidCachedPost(post: DeepPost): boolean {
+  if (post.link_valid === false) return true;
+  const u = (post.url || "").toLowerCase();
+  return u.includes("fb_scrape_card=") || u.includes("/search/posts/") || u.includes("/search/top/");
+}
+
 function primaryText(post: DeepPost) {
   return (post.group_about || post.caption || post.text || "").trim();
 }
@@ -187,22 +196,10 @@ function passesResultFilter(post: DeepPost, filter: ResultFilter): boolean {
 }
 
 function sortPostsForDisplay(items: DeepPost[], sortBy: DeepSort): DeepPost[] {
-  const isVideo = (post: DeepPost) => {
-    const t = (post.type || "").toLowerCase();
-    const u = (post.url || "").toLowerCase();
-    return ["videos", "video", "reel", "reels", "watch"].includes(t) || /\/(reel|reels|videos|watch)/.test(u);
-  };
   const value = (post: DeepPost) => {
     if (sortBy === "trending" || sortBy === "viral") {
-      if (isVideo(post)) {
-        return (
-          metricNum(post.views_count) * 1_000_000 +
-          metricNum(post.comments_count) * 10_000 +
-          metricNum(post.likes_count) * 100 +
-          metricNum(post.shares_count) * 50 +
-          metricNum(post.viral_score)
-        );
-      }
+      // Video & post pakai ranking yang sama: comments + likes dulu, views belakangan,
+      // supaya views besar pada video tidak otomatis mendominasi urutan feed.
       return (
         metricNum(post.comments_count) * 1_000_000 +
         metricNum(post.likes_count) * 10_000 +
@@ -545,7 +542,7 @@ export default function DeepSearchPage() {
   const [query,   setQuery]   = usePersistState("deep-query",           "");
   const [types,   setTypes]   = usePersistState<string[]>("deep-types", ["posts", "videos"]);
   const [sortBy,  setSortBy]  = usePersistState<DeepSort>("deep-sort-v3", "trending");
-  const [contentMixMode, setContentMixMode] = usePersistState<ContentMixMode>("deep-content-mix-mode", "posts_first_80_20");
+  const contentMixMode: ContentMixMode = "posts_first_80_20";
   const [resultFilter, setResultFilter] = usePersistState<ResultFilter>("deep-result-filter", "all");
   const [maxTotal,            setMaxTotal]            = useState(1000);
   const [recentDays,          setRecentDays]          = useState(30);
@@ -573,7 +570,10 @@ export default function DeepSearchPage() {
   const otherRun = isRunning && !isMyJob;
 
   const jobPosts    = job?.type === "deep" && job.status === "done" ? (job.deepPosts as DeepPost[]) : [];
-  const allPosts    = jobPosts.length > 0 ? jobPosts : posts.length > 0 ? posts : cachedPosts;
+  const allPosts    = useMemo(
+    () => (jobPosts.length > 0 ? jobPosts : posts.length > 0 ? posts : cachedPosts).filter(p => !isInvalidCachedPost(p)),
+    [jobPosts, posts, cachedPosts],
+  );
 
   // Split: post "nyata" vs post data terbatas
   const realPosts  = useMemo(() => allPosts.filter(p => isRealPost(p) && (hasContent(p) || hasEngagement(p))), [allPosts]);
@@ -614,13 +614,6 @@ export default function DeepSearchPage() {
     { value: "comments", label: "Komentar" },
     { value: "shares", label: "Share" },
     { value: "views", label: "Views" },
-  ];
-  const contentMixOptions: Array<{ value: ContentMixMode; label: string }> = [
-    { value: "posts_first_80_20", label: "Prioritas Posts 80/20" },
-    { value: "posts_first_60_40", label: "Posts 60 / Reels 40" },
-    { value: "balanced_50_50", label: "Balanced 50/50" },
-    { value: "posts_only", label: "Posts Only" },
-    { value: "videos_only", label: "Videos Only" },
   ];
   const resultFilterOptions: Array<{ value: ResultFilter; label: string }> = [
     { value: "all", label: "Semua" },
@@ -949,27 +942,6 @@ export default function DeepSearchPage() {
             </div>
           </div>
         )}
-
-        <div>
-          <label className="text-sm font-medium mb-2 block" style={{ color: "#4a5070" }}>Prioritas Konten</label>
-          <div className="flex flex-wrap gap-2">
-            {contentMixOptions.map(opt => (
-              <button
-                key={opt.value}
-                onClick={() => setContentMixMode(opt.value)}
-                disabled={isMyRun}
-                className="px-3 py-2 rounded-xl text-sm font-medium transition-all"
-                style={{
-                  background: contentMixMode === opt.value ? "rgba(107,94,199,0.1)" : "rgba(0,0,0,0.04)",
-                  color: contentMixMode === opt.value ? "#6b5ec7" : "#4a5070",
-                  border: contentMixMode === opt.value ? "1px solid rgba(107,94,199,0.25)" : "1px solid transparent",
-                }}
-              >
-                {opt.label}
-              </button>
-            ))}
-          </div>
-        </div>
 
         <label
           className="flex items-start gap-3 rounded-xl px-4 py-3 text-sm"

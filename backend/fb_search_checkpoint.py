@@ -308,10 +308,10 @@ def _priority_sort_key(item: dict):
     _assign_viral_fields_local(item)
     is_video = _is_video_result(item)
     primary_metrics = (
-        _metric_value(item.get("views_count")),
         _metric_value(item.get("comments_count")),
         _metric_value(item.get("likes_count")),
         _metric_value(item.get("shares_count")),
+        _metric_value(item.get("views_count")),
     ) if is_video else (
         _metric_value(item.get("comments_count")),
         _metric_value(item.get("likes_count")),
@@ -715,19 +715,15 @@ def _is_valid_result_url(url: str) -> bool:
         return True
     return False
 
-def _is_search_post_card(item: dict, url: str) -> bool:
-    if (item.get("source") or "") != "search_post_card":
-        return False
-    u = (url or "").lower()
-    if "facebook.com/search/posts/" not in u or "fb_scrape_card=" not in u:
-        return False
-    text = " ".join(str(item.get(k, "") or "") for k in ("text", "caption", "author"))
-    return len(text.strip()) >= 20
-
 def _accept_result_item(item: dict, url: str) -> bool:
+    # Hanya terima item yang URL-nya permalink post/video/foto asli yang bisa dibuka.
+    # Placeholder kartu pencarian (/search/posts/?...&fb_scrape_card=...) di-drop di sini
+    # supaya tidak ikut masuk hasil, tidak di-scrape detail/komentar, dan tidak tampil di frontend.
     if not url:
         return False
-    return _is_valid_result_url(url) or _is_search_post_card(item, url)
+    if "fb_scrape_card=" in url.lower():
+        return False
+    return _is_valid_result_url(url)
 
 def _content_key(url: str) -> str:
     if not url:
@@ -863,6 +859,27 @@ def _second_pass_post_link_validation(job_id: str, monitor, posts: list, config:
     for item in posts:
         _assign_viral_fields_local(item)
     _write_posts(job_id, posts)
+
+
+def _prune_invalid_links(job_id: str, posts: list) -> None:
+    """Drop item yang link-nya gagal validasi detail (link_valid=False) atau masih
+    placeholder kartu pencarian, sebelum enrich komentar. Mutasi `posts` di tempat dan
+    flush ke disk kalau ada yang dibuang supaya hemat CPU (tidak scrape komentar item invalid)."""
+    if not posts:
+        return
+    before = len(posts)
+    kept = [
+        p for p in posts
+        if p.get("link_valid") is not False
+        and _accept_result_item(p, p.get("url") or p.get("cleanHref") or "")
+    ]
+    removed = before - len(kept)
+    if removed:
+        posts[:] = kept
+        _log_progress(job_id, f"Prune {removed} item link invalid (sisa {len(posts)})")
+        _write_posts(job_id, posts)
+
+
 def _second_pass_video_metrics(job_id: str, monitor, posts: list, config: dict):
     if not posts:
         return
@@ -1013,6 +1030,7 @@ def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
             raise RuntimeError(_session_error_message())
         _second_pass_video_metrics(job_id, monitor, posts, config)
         _second_pass_post_link_validation(job_id, monitor, posts, config)
+        _prune_invalid_links(job_id, posts)
         if max_comments_per_post > 0 and posts:
             _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
             monitor.enrich_comments(
@@ -1072,6 +1090,7 @@ def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
             raise RuntimeError(_session_error_message())
         _second_pass_video_metrics(job_id, monitor, posts, config)
         _second_pass_post_link_validation(job_id, monitor, posts, config)
+        _prune_invalid_links(job_id, posts)
         if max_comments_per_post > 0 and posts:
             _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
             monitor.enrich_comments(
@@ -1138,6 +1157,7 @@ def _worker_keyword(job_id: str, keyword: str, config: dict, monitor):
         raise RuntimeError(_session_error_message())
     _second_pass_video_metrics(job_id, monitor, posts, config)
     _second_pass_post_link_validation(job_id, monitor, posts, config)
+    _prune_invalid_links(job_id, posts)
     if max_comments_per_post > 0 and posts:
         _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
         monitor.enrich_comments(
@@ -1242,6 +1262,7 @@ def _worker_hashtag(job_id: str, tag: str, config: dict, monitor):
             raise RuntimeError(_session_error_message())
         _second_pass_video_metrics(job_id, monitor, posts, config)
         _second_pass_post_link_validation(job_id, monitor, posts, config)
+        _prune_invalid_links(job_id, posts)
         if max_comments_per_post > 0 and posts:
             _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
             monitor.enrich_comments(
@@ -1311,6 +1332,7 @@ def _worker_hashtag(job_id: str, tag: str, config: dict, monitor):
         raise RuntimeError(_session_error_message())
     _second_pass_video_metrics(job_id, monitor, posts, config)
     _second_pass_post_link_validation(job_id, monitor, posts, config)
+    _prune_invalid_links(job_id, posts)
     if max_comments_per_post > 0 and posts:
         _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
         monitor.enrich_comments(
@@ -1417,6 +1439,7 @@ def _worker_trending(job_id: str, query: str, config: dict, monitor):
         raise RuntimeError(_session_error_message())
     _second_pass_video_metrics(job_id, monitor, posts, config)
     _second_pass_post_link_validation(job_id, monitor, posts, config)
+    _prune_invalid_links(job_id, posts)
     if max_comments_per_post > 0 and posts:
         _log_progress(job_id, f"Scraping comments for {len(posts)} unique results...")
         monitor.enrich_comments(
